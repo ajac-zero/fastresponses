@@ -19,9 +19,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .adapter import AgentAdapter, AgentRun
+from .compaction import compact_items
 from .engine import ResponseEngine, collect_response
 from .models import (
     ERROR_STATUS_CODES,
+    CompactResource,
     ErrorBody,
     ErrorEnvelope,
     Item,
@@ -158,6 +160,20 @@ def create_app(
                 param=getattr(response.error, "param", None),
             )
         return JSONResponse(content=response.model_dump(exclude_none=False))
+
+    @app.post("/v1/responses/compact")
+    async def compact_response(payload: ResponsesRequest, request: Request):
+        await _authorize(request)
+        if not payload.model:
+            raise ApiError(
+                "The 'model' parameter is required.",
+                type="invalid_request",
+                code="missing_required_parameter",
+                param="model",
+            )
+        run = await _build_run(payload)
+        compacted = CompactResource(output=[compact_items(run.context_items)])
+        return JSONResponse(content=compacted.model_dump())
 
     @app.get("/v1/responses/{response_id}")
     async def get_response(response_id: str, request: Request):

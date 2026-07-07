@@ -35,3 +35,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "compliance: runs the official Open Responses compliance suite (needs bun + network on first run)",
+]

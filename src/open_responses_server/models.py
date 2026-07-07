@@ -42,6 +42,10 @@ def new_reasoning_id() -> str:
     return _id("rs")
 
 
+def new_compaction_id() -> str:
+    return _id("cmp")
+
+
 # ---------------------------------------------------------------------------
 # Content parts
 # ---------------------------------------------------------------------------
@@ -153,6 +157,18 @@ class FunctionCallOutputItem(BaseModel):
     status: ItemStatus | None = None
 
 
+class CompactionItem(BaseModel):
+    """A compacted context window produced by ``/v1/responses/compact``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["compaction"] = "compaction"
+    id: str | None = None
+    status: ItemStatus | None = None
+    encrypted_content: str = ""
+    created_by: str | None = None
+
+
 class ReasoningItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -187,6 +203,7 @@ Item = Annotated[
         FunctionCallItem,
         FunctionCallOutputItem,
         ReasoningItem,
+        CompactionItem,
         ItemReference,
         CustomItem,
     ],
@@ -322,29 +339,58 @@ class IncompleteDetails(BaseModel):
     reason: str | None = None
 
 
+class TextFormat(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "text"
+
+
+class TextField(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    format: TextFormat = Field(default_factory=TextFormat)
+
+
+class ReasoningField(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    effort: str | None = None
+    summary: str | None = None
+
+
 class Response(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str = Field(default_factory=new_response_id)
     object: Literal["response"] = "response"
     created_at: int = Field(default_factory=lambda: int(time.time()))
+    completed_at: int | None = None
     status: ResponseStatus = "in_progress"
-    model: str | None = None
+    model: str = "unknown"
     output: list[Item] = Field(default_factory=list)
     error: ResponseError | None = None
     incomplete_details: IncompleteDetails | None = None
     instructions: str | None = None
     previous_response_id: str | None = None
-    store: bool | None = True
-    background: bool | None = False
+    store: bool = True
+    background: bool = False
     tools: list[Tool] = Field(default_factory=list)
     tool_choice: ToolChoice = "auto"
-    parallel_tool_calls: bool | None = True
-    temperature: float | None = None
-    top_p: float | None = None
+    parallel_tool_calls: bool = True
+    temperature: float = 1.0
+    top_p: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    top_logprobs: int = 0
     max_output_tokens: int | None = None
-    truncation: Literal["auto", "disabled"] | None = None
-    metadata: dict[str, str] | None = None
+    max_tool_calls: int | None = None
+    truncation: Literal["auto", "disabled"] = "disabled"
+    text: TextField = Field(default_factory=TextField)
+    reasoning: ReasoningField | None = None
+    service_tier: str = "default"
+    metadata: dict[str, str] = Field(default_factory=dict)
+    safety_identifier: str | None = None
+    prompt_cache_key: str | None = None
     usage: Usage | None = None
 
     @property
@@ -355,6 +401,18 @@ class Response(BaseModel):
             if isinstance(item, MessageItem) and item.role == "assistant":
                 chunks.append(item.text())
         return "".join(chunks)
+
+
+class CompactResource(BaseModel):
+    """Result of ``POST /v1/responses/compact``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(default_factory=new_response_id)
+    object: Literal["response.compaction"] = "response.compaction"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    output: list[Item] = Field(default_factory=list)
+    usage: Usage = Field(default_factory=Usage)
 
 
 # ---------------------------------------------------------------------------

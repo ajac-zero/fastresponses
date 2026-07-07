@@ -36,7 +36,7 @@ from google.adk.sessions import BaseSessionService, InMemorySessionService, Sess
 from google.adk.tools import BaseTool, ToolContext
 from google.genai import types
 
-from ..adapter import (
+from ..adapter import (  # noqa: I001
     AdapterError,
     AdapterEvent,
     AgentAdapter,
@@ -48,7 +48,9 @@ from ..adapter import (
     TextDelta,
     UsageDelta,
 )
+from ..compaction import expand_compaction_item
 from ..models import (
+    CompactionItem,
     CustomItem,
     FunctionCallItem,
     FunctionCallOutputItem,
@@ -283,7 +285,13 @@ class ADKAdapter(AgentAdapter):
     ) -> None:
         """Append prior conversation items as ADK session events."""
         invocation_id = f"or-seed-{uuid.uuid4().hex}"
+        expanded: list[Item] = []
         for item in items:
+            if isinstance(item, CompactionItem):
+                expanded.extend(expand_compaction_item(item))
+            else:
+                expanded.append(item)
+        for item in expanded:
             event = self._history_event(item, call_map, invocation_id)
             if event is not None:
                 await self.session_service.append_event(session, event)

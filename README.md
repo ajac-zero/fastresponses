@@ -33,8 +33,12 @@ zero custom integration.
   as `encrypted_content` when available.
 - `instructions`, `temperature`, `top_p`, `max_output_tokens`, `tool_choice`
   (`auto` / `required` / `none` / forced function / `allowed_tools`) mapped to ADK.
+- **`POST /v1/responses/compact`** — compacts a conversation into a single
+  round-trippable `compaction` item that can seed a new response chain.
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `store: false`, usage
   accounting, structured error envelopes, optional bearer-token auth.
+- **Passes the official Open Responses acceptance tests** (all HTTP-transport
+  tests of the [compliance suite](https://www.openresponses.org/compliance)).
 
 ## Install
 
@@ -167,6 +171,23 @@ uv run pytest
 
 Tests run fully offline: protocol tests use a scripted adapter, and ADK tests
 drive a real ADK `Runner` with a scripted `BaseLlm` (no API key needed).
+
+### Compliance suite
+
+`tests/test_compliance.py` runs the official Open Responses acceptance tests
+(the CLI runner from [openresponses/openresponses](https://github.com/openresponses/openresponses),
+same suite as the [web tester](https://www.openresponses.org/compliance))
+against a local server backed by a deterministic ADK agent:
+
+```bash
+uv run pytest -m compliance
+```
+
+It needs `bun` on PATH and network access on the first run (the spec repo is
+pinned and cached under `.compliance/`; pin a different revision with
+`OPENRESPONSES_SPEC_REF`). Without `bun` the test skips itself. All
+HTTP-transport tests pass; WebSocket-transport tests are excluded because the
+WebSocket transport is not implemented.
 
 ## Current limitations
 

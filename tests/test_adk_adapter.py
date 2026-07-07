@@ -351,6 +351,52 @@ def test_stateless_history_replay():
     assert texts == ["capital of France?", "Paris.", "population?"]
 
 
+def test_compaction_round_trip():
+    client, llm = make_adk_client([text_turn("Paris.")])
+    compacted = client.post(
+        "/v1/responses/compact",
+        json={
+            "model": "compliance-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "capital of France?"},
+                {"type": "message", "role": "assistant", "content": "It is Paris."},
+            ],
+        },
+    ).json()
+    assert compacted["object"] == "response.compaction"
+    item = compacted["output"][0]
+    assert item["type"] == "compaction"
+    assert item["id"].startswith("cmp_")
+    assert item["encrypted_content"]
+
+    # Use the compacted window as the base input of a new chain.
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                item,
+                {"type": "message", "role": "user", "content": "Repeat the capital."},
+            ]
+        },
+    ).json()
+    assert body["status"] == "completed"
+    # The compacted history was expanded into the model's context.
+    texts = [
+        part.text
+        for content in llm.requests[0].contents
+        for part in (content.parts or [])
+        if part.text
+    ]
+    assert texts == ["capital of France?", "It is Paris.", "Repeat the capital."]
+
+
+def test_compact_requires_model():
+    client, _ = make_adk_client([])
+    r = client.post("/v1/responses/compact", json={"input": "hello"})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "missing_required_parameter"
+
+
 def test_input_must_end_with_user_message_or_tool_output():
     client, _ = make_adk_client([])
     r = client.post(

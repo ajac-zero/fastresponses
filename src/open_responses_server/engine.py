@@ -9,6 +9,7 @@ persistence into the response store.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -170,18 +171,23 @@ class _TurnState:
 
         request = run.request
         self.response_template = Response(
-            model=request.model or adapter.default_model,
+            model=request.model or adapter.default_model or adapter.name,
             instructions=request.instructions,
             previous_response_id=request.previous_response_id,
-            store=request.store,
+            store=request.store if request.store is not None else True,
             tools=request.tools,
             tool_choice=request.tool_choice,
-            parallel_tool_calls=request.parallel_tool_calls,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            parallel_tool_calls=(
+                request.parallel_tool_calls
+                if request.parallel_tool_calls is not None
+                else True
+            ),
+            temperature=request.temperature if request.temperature is not None else 1.0,
+            top_p=request.top_p if request.top_p is not None else 1.0,
             max_output_tokens=request.max_output_tokens,
-            truncation=request.truncation,
-            metadata=request.metadata,
+            truncation=request.truncation or "disabled",
+            metadata=request.metadata or {},
+            service_tier=request.service_tier or "default",
         )
 
         # Open assistant message being streamed, if any.
@@ -205,6 +211,8 @@ class _TurnState:
     def snapshot(self, status: str = "in_progress") -> Response:
         response = self.response_template.model_copy(deep=True)
         response.status = status  # type: ignore[assignment]
+        if status in ("completed", "failed", "incomplete", "cancelled"):
+            response.completed_at = int(time.time())
         response.output = list(self.output)
         if self._reasoning is not None:
             response.output.append(self._reasoning.model_copy(deep=True))
