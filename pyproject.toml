@@ -1,0 +1,37 @@
+[project]
+name = "open-responses-server"
+version = "0.1.0"
+description = "Serve agent frameworks (Google ADK first) over the Open Responses API"
+readme = "README.md"
+authors = [
+    { name = "A8065384", email = "anibal.angulo.cardoza@banorte.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.139.0",
+    "pydantic>=2.13.4",
+    "uvicorn[standard]>=0.50.2",
+]
+
+[project.scripts]
+open-responses-server = "open_responses_server:main"
+
+[project.optional-dependencies]
+adk = [
+    "google-adk>=2.3.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

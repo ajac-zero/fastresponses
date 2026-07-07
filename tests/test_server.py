@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from open_responses_server.adapter import (
+    AdapterError,
+    ItemDone,
+    StateUpdate,
+    TextDelta,
+    UsageDelta,
+)
+from open_responses_server.models import FunctionCallItem
+
+from conftest import make_client, read_sse
+
+
+def simple_script(run):
+    yield TextDelta("Hello")
+    yield TextDelta(" world")
+    yield UsageDelta(input_tokens=3, output_tokens=2, total_tokens=5)
+    yield StateUpdate({"turn": len(run.context_items)})
+
+
+def test_non_streaming_text_response():
+    client, _ = make_client(simple_script)
+    r = client.post("/v1/responses", json={"model": "m1", "input": "hi"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "response"
+    assert body["id"].startswith("resp_")
+    assert body["status"] == "completed"
+    assert body["model"] == "m1"
+    message = body["output"][0]
+    assert message["type"] == "message"
+    assert message["role"] == "assistant"
+    assert message["status"] == "completed"
+    assert message["content"] == [
+        {"type": "output_text", "text": "Hello world", "annotations": []}
+    ]
+    assert body["usage"]["input_tokens"] == 3
+    assert body["usage"]["output_tokens"] == 2
+    assert body["usage"]["total_tokens"] == 5
+
+
+def test_default_model_used_when_request_omits_model():
+    client, _ = make_client(simple_script)
+    r = client.post("/v1/responses", json={"input": "hi"})
+    assert r.json()["model"] == "fake-model"
+
+
+def test_streaming_event_sequence():
+    client, _ = make_client(simple_script)
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "hi", "stream": True}
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        events = read_sse(r)
+
+    assert events[-1] == "[DONE]"
+    payloads = [e for e in events if isinstance(e, dict)]
+    types = [e["type"] for e in payloads]
+    assert types == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    # sequence numbers strictly increase from 0
+    assert [e["sequence_number"] for e in payloads] == list(range(len(payloads)))
+    deltas = [e["delta"] for e in payloads if e["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello", " world"]
+    done = payloads[types.index("response.output_text.done")]
+    assert done["text"] == "Hello world"
+    completed = payloads[-1]
+    assert completed["response"]["status"] == "completed"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "Hello world"
+    # item ids are consistent across the message lifecycle
+    item_id = payloads[2]["item"]["id"]
+    assert all(
+        e.get("item_id", item_id) == item_id
+        for e in payloads
+        if e["type"].startswith(("response.output_text", "response.content_part"))
+    )
+
+
+def function_call_script(run):
+    if run.previous_state is None:
+        yield TextDelta("Let me check.")
+        yield ItemDone(
+            FunctionCallItem(
+                id="fc_1",
+                call_id="call_abc",
+                name="get_weather",
+                arguments='{"city": "Tokyo"}',
+                status="completed",
+            )
+        )
+        yield StateUpdate({"pending": "call_abc"})
+    else:
+        yield TextDelta("It is sunny.")
+        yield StateUpdate({"pending": None})
+
+
+def test_function_call_and_continuation():
+    client, adapter = make_client(function_call_script)
+    r1 = client.post(
+        "/v1/responses",
+        json={
+            "input": "weather in tokyo?",
+            "tools": [{"type": "function", "name": "get_weather", "parameters": {}}],
+        },
+    )
+    body1 = r1.json()
+    assert body1["status"] == "completed"
+    fc = body1["output"][1]
+    assert fc["type"] == "function_call"
+    assert fc["call_id"] == "call_abc"
+    assert fc["name"] == "get_weather"
+
+    r2 = client.post(
+        "/v1/responses",
+        json={
+            "previous_response_id": body1["id"],
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": '{"temp": 20}',
+                }
+            ],
+        },
+    )
+    body2 = r2.json()
+    assert body2["status"] == "completed"
+    assert body2["output"][0]["content"][0]["text"] == "It is sunny."
+    assert body2["previous_response_id"] == body1["id"]
+
+    # adapter got the stored state and the full logical context
+    run2 = adapter.runs[1]
+    assert run2.previous_state == {"pending": "call_abc"}
+    context_types = [item.type for item in run2.context_items]
+    assert context_types == [
+        "message",  # original user input
+        "message",  # assistant "Let me check."
+        "function_call",
+        "function_call_output",
+    ]
+
+
+def test_function_call_streaming_events():
+    client, _ = make_client(function_call_script)
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"input": "weather?", "stream": True},
+    ) as r:
+        events = read_sse(r)
+    types = [e["type"] for e in events if isinstance(e, dict)]
+    assert "response.function_call_arguments.delta" in types
+    assert "response.function_call_arguments.done" in types
+    # message closes before the function_call item is added
+    assert types.index("response.output_item.done") < types.index(
+        "response.function_call_arguments.delta"
+    )
+
+
+def test_previous_response_not_found():
+    client, _ = make_client(simple_script)
+    r = client.post(
+        "/v1/responses",
+        json={"input": "hi", "previous_response_id": "resp_missing"},
+    )
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["code"] == "previous_response_not_found"
+    assert error["param"] == "previous_response_id"
+
+
+def test_get_and_delete_stored_response():
+    client, _ = make_client(simple_script)
+    response_id = client.post("/v1/responses", json={"input": "hi"}).json()["id"]
+
+    got = client.get(f"/v1/responses/{response_id}")
+    assert got.status_code == 200
+    assert got.json()["id"] == response_id
+
+    deleted = client.delete(f"/v1/responses/{response_id}")
+    assert deleted.json() == {
+        "id": response_id,
+        "object": "response",
+        "deleted": True,
+    }
+    assert client.get(f"/v1/responses/{response_id}").status_code == 404
+
+
+def test_store_false_is_not_persisted():
+    client, _ = make_client(simple_script)
+    response_id = client.post(
+        "/v1/responses", json={"input": "hi", "store": False}
+    ).json()["id"]
+    assert client.get(f"/v1/responses/{response_id}").status_code == 404
+
+
+def test_invalid_body_returns_error_envelope():
+    client, _ = make_client(simple_script)
+    r = client.post("/v1/responses", json={"input": 42})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request"
+
+
+def test_api_key_auth():
+    client, _ = make_client(simple_script, api_key="sekret")
+    assert client.post("/v1/responses", json={"input": "hi"}).status_code == 401
+    assert (
+        client.post(
+            "/v1/responses",
+            json={"input": "hi"},
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code
+        == 401
+    )
+    ok = client.post(
+        "/v1/responses",
+        json={"input": "hi"},
+        headers={"Authorization": "Bearer sekret"},
+    )
+    assert ok.status_code == 200
+
+
+def failing_script(run):
+    yield TextDelta("partial")
+    raise AdapterError("model exploded", type="model_error", code="boom")
+
+
+def test_adapter_error_non_streaming():
+    client, _ = make_client(failing_script)
+    r = client.post("/v1/responses", json={"input": "hi"})
+    assert r.status_code == 500
+    assert r.json()["error"]["code"] == "boom"
+
+
+def test_adapter_error_streaming_emits_error_then_failed():
+    client, _ = make_client(failing_script)
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "hi", "stream": True}
+    ) as r:
+        events = read_sse(r)
+    payloads = [e for e in events if isinstance(e, dict)]
+    types = [e["type"] for e in payloads]
+    assert types[-2:] == ["error", "response.failed"]
+    failed = payloads[-1]["response"]
+    assert failed["status"] == "failed"
+    assert failed["error"]["code"] == "boom"
+    assert events[-1] == "[DONE]"
