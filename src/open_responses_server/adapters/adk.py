@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -41,6 +42,7 @@ from ..adapter import (  # noqa: I001
     AdapterEvent,
     AgentAdapter,
     AgentRun,
+    Incomplete,
     ItemAdded,
     ItemDone,
     ReasoningDelta,
@@ -55,7 +57,12 @@ from ..models import (
     FunctionCallItem,
     FunctionCallOutputItem,
     FunctionTool,
+    InputFile,
+    InputImage,
+    InputText,
     Item,
+    JsonObjectResponseFormat,
+    JsonSchemaResponseFormat,
     MessageItem,
     ToolChoiceAllowed,
     ToolChoiceFunction,
@@ -68,6 +75,86 @@ EXTENSION_FUNCTION_CALL = "adk:function_call"
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+def _decode_data_url(url: str) -> types.Blob | None:
+    """Decode a ``data:<mime>;base64,<data>`` URL into a genai Blob."""
+    header, _, data = url.partition(",")
+    if not data or "base64" not in header:
+        return None
+    mime = header.removeprefix("data:").split(";")[0] or "application/octet-stream"
+    try:
+        return types.Blob(mime_type=mime, data=base64.b64decode(data))
+    except (ValueError, TypeError):
+        return None
+
+
+def _guess_mime(filename: str | None, default: str = "application/octet-stream") -> str:
+    if filename:
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed:
+            return guessed
+    return default
+
+
+def _allowed_tools_guard(allowed: set[str]):
+    """ADK before_tool_callback that blocks tools outside the allowed set."""
+
+    def guard(*, tool: BaseTool, args: dict[str, Any], tool_context: ToolContext):
+        if tool.name not in allowed:
+            return {
+                "error": (
+                    f"Tool '{tool.name}' is not allowed for this request "
+                    "(restricted by allowed_tools)."
+                )
+            }
+        return None
+
+    return guard
+
+
+def _content_part_to_adk(part: Any) -> types.Part | None:
+    """Translate an Open Responses user content part to a genai Part."""
+    if isinstance(part, InputText):
+        return types.Part(text=part.text) if part.text else None
+    if isinstance(part, InputImage):
+        if part.image_url:
+            if part.image_url.startswith("data:"):
+                blob = _decode_data_url(part.image_url)
+                if blob is not None:
+                    return types.Part(inline_data=blob)
+                return None
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=part.image_url,
+                    mime_type=_guess_mime(part.image_url, "image/jpeg"),
+                )
+            )
+        return None
+    if isinstance(part, InputFile):
+        if part.file_data:
+            try:
+                data = base64.b64decode(part.file_data)
+            except (ValueError, TypeError):
+                return None
+            return types.Part(
+                inline_data=types.Blob(
+                    mime_type=_guess_mime(part.filename), data=data
+                )
+            )
+        if part.file_url:
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=part.file_url,
+                    mime_type=_guess_mime(part.filename or part.file_url),
+                )
+            )
+        return None
+    # Unknown content parts: fall back to any text they carry.
+    text = getattr(part, "text", None)
+    if isinstance(text, str) and text:
+        return types.Part(text=text)
+    return None
 
 
 class ClientFunctionTool(BaseTool):
@@ -157,6 +244,8 @@ class ADKAdapter(AgentAdapter):
 
         client_tool_names = {t.name for t in client_tools}
         translator = _EventTranslator(client_tool_names, call_map)
+        max_tool_calls = run.request.max_tool_calls
+        tool_calls = 0
 
         try:
             async for event in runner.run_async(
@@ -165,6 +254,12 @@ class ADKAdapter(AgentAdapter):
                 new_message=new_message,
                 run_config=RunConfig(streaming_mode=StreamingMode.SSE),
             ):
+                if max_tool_calls is not None and not event.partial:
+                    pending = len(event.get_function_calls())
+                    if pending and tool_calls + pending > max_tool_calls:
+                        yield Incomplete("max_tool_calls")
+                        break
+                    tool_calls += pending
                 for adapter_event in translator.translate(event):
                     yield adapter_event
         except AdapterError:
@@ -233,9 +328,9 @@ class ADKAdapter(AgentAdapter):
                 parts.append(types.Part(text=message.content))
         else:
             for part in message.content:
-                text = getattr(part, "text", None)
-                if isinstance(text, str) and text:
-                    parts.append(types.Part(text=text))
+                adk_part = _content_part_to_adk(part)
+                if adk_part is not None:
+                    parts.append(adk_part)
         if not parts:
             parts.append(types.Part(text=""))
         return parts
@@ -304,19 +399,24 @@ class ADKAdapter(AgentAdapter):
     ) -> Event | None:
         agent_name = self.agent.name
         if isinstance(item, MessageItem):
-            text = item.text()
-            if not text:
-                return None
             if item.role == "assistant":
+                text = item.text()
+                if not text:
+                    return None
                 return Event(
                     invocation_id=invocation_id,
                     author=agent_name,
                     content=types.Content(role="model", parts=[types.Part(text=text)]),
                 )
+            parts = self._user_message_parts(item)
+            if all(p.text == "" for p in parts if p.text is not None) and not any(
+                p.inline_data or p.file_data for p in parts
+            ):
+                return None
             return Event(
                 invocation_id=invocation_id,
                 author="user",
-                content=types.Content(role="user", parts=[types.Part(text=text)]),
+                content=types.Content(role="user", parts=parts),
             )
         if isinstance(item, FunctionCallItem):
             mapping = call_map.setdefault(
@@ -379,10 +479,23 @@ class ADKAdapter(AgentAdapter):
             config = self._generate_content_config(run)
             if config is not None:
                 update["generate_content_config"] = config
+            # `allowed_tools` is a hard constraint: block execution of any
+            # tool outside the allowed set, not just hint the model.
+            allowed = self._allowed_tool_names(request.tool_choice)
+            if allowed is not None:
+                update["before_tool_callback"] = _allowed_tools_guard(allowed)
 
         if not update:
             return self.agent
         return self.agent.clone(update=update)
+
+    @staticmethod
+    def _allowed_tool_names(choice: Any) -> set[str] | None:
+        if isinstance(choice, ToolChoiceAllowed):
+            return {t.get("name") for t in choice.tools if t.get("name")}
+        if isinstance(choice, ToolChoiceFunction):
+            return {choice.name}
+        return None
 
     def _generate_content_config(
         self, run: AgentRun
@@ -401,13 +514,55 @@ class ADKAdapter(AgentAdapter):
             ensure().temperature = request.temperature
         if request.top_p is not None:
             ensure().top_p = request.top_p
+        if request.presence_penalty is not None:
+            ensure().presence_penalty = request.presence_penalty
+        if request.frequency_penalty is not None:
+            ensure().frequency_penalty = request.frequency_penalty
         if request.max_output_tokens is not None:
             ensure().max_output_tokens = request.max_output_tokens
+        if request.top_logprobs:
+            ensure().response_logprobs = True
+            ensure().logprobs = request.top_logprobs
+
+        # text.format -> structured output
+        fmt = request.text.format if request.text is not None else None
+        if isinstance(fmt, JsonSchemaResponseFormat):
+            ensure().response_mime_type = "application/json"
+            if fmt.json_schema:
+                ensure().response_json_schema = fmt.json_schema
+        elif isinstance(fmt, JsonObjectResponseFormat):
+            ensure().response_mime_type = "application/json"
+
+        # reasoning -> thinking config
+        thinking = self._thinking_config(run)
+        if thinking is not None:
+            ensure().thinking_config = thinking
 
         tool_config = self._tool_config(run)
         if tool_config is not None:
             ensure().tool_config = tool_config
 
+        return config
+
+    _THINKING_BUDGETS = {
+        "none": 0,
+        "minimal": 512,
+        "low": 1024,
+        "medium": 8192,
+        "high": 24576,
+        "xhigh": 32768,
+    }
+
+    def _thinking_config(self, run: AgentRun) -> types.ThinkingConfig | None:
+        reasoning = run.request.reasoning
+        if reasoning is None or (reasoning.effort is None and reasoning.summary is None):
+            return None
+        include_thoughts = reasoning.summary is not None or (
+            reasoning.effort is not None and reasoning.effort != "none"
+        )
+        config = types.ThinkingConfig(include_thoughts=include_thoughts)
+        if reasoning.effort is not None:
+            config.thinking_budget = self._THINKING_BUDGETS.get(reasoning.effort)
         return config
 
     def _tool_config(self, run: AgentRun) -> types.ToolConfig | None:
@@ -509,6 +664,9 @@ class _EventTranslator:
                     cached_tokens=usage.cached_content_token_count or 0,
                 )
             )
+
+        if event.finish_reason == types.FinishReason.MAX_TOKENS:
+            out.append(Incomplete("max_output_tokens"))
         return out
 
     def _final_reasoning(self, parts: list[types.Part]) -> list[AdapterEvent]:

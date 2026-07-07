@@ -421,3 +421,281 @@ def test_request_instructions_override_agent_instruction():
     )
     system = llm.requests[0].config.system_instruction
     assert "Answer only in French." in str(system)
+
+
+# ---------------------------------------------------------------------------
+# Sampling / generation parameter mapping
+# ---------------------------------------------------------------------------
+
+
+def test_sampling_parameters_map_to_generate_content_config():
+    client, llm = make_adk_client([text_turn("OK")])
+    client.post(
+        "/v1/responses",
+        json={
+            "input": "hi",
+            "temperature": 0.1,
+            "top_p": 0.8,
+            "presence_penalty": 0.5,
+            "frequency_penalty": -0.5,
+            "top_logprobs": 5,
+            "max_output_tokens": 128,
+        },
+    )
+    config = llm.requests[0].config
+    assert config.temperature == 0.1
+    assert config.top_p == 0.8
+    assert config.presence_penalty == 0.5
+    assert config.frequency_penalty == -0.5
+    assert config.response_logprobs is True
+    assert config.logprobs == 5
+    assert config.max_output_tokens == 128
+
+
+def test_text_format_json_schema_maps_to_structured_output():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    client, llm = make_adk_client([text_turn('{"answer": "42"}')])
+    r = client.post(
+        "/v1/responses",
+        json={
+            "input": "hi",
+            "text": {
+                "format": {"type": "json_schema", "name": "reply", "schema": schema}
+            },
+        },
+    )
+    config = llm.requests[0].config
+    assert config.response_mime_type == "application/json"
+    assert config.response_json_schema == schema
+    assert r.json()["text"]["format"]["type"] == "json_schema"
+
+
+def test_text_format_json_object_sets_mime_type():
+    client, llm = make_adk_client([text_turn("{}")])
+    client.post(
+        "/v1/responses",
+        json={"input": "hi", "text": {"format": {"type": "json_object"}}},
+    )
+    config = llm.requests[0].config
+    assert config.response_mime_type == "application/json"
+    assert config.response_json_schema is None
+
+
+def test_reasoning_effort_maps_to_thinking_config():
+    client, llm = make_adk_client([text_turn("OK")])
+    client.post(
+        "/v1/responses",
+        json={"input": "hi", "reasoning": {"effort": "low", "summary": "auto"}},
+    )
+    thinking = llm.requests[0].config.thinking_config
+    assert thinking is not None
+    assert thinking.include_thoughts is True
+    assert thinking.thinking_budget == 1024
+
+
+def test_reasoning_effort_none_disables_thinking():
+    client, llm = make_adk_client([text_turn("OK")])
+    client.post("/v1/responses", json={"input": "hi", "reasoning": {"effort": "none"}})
+    thinking = llm.requests[0].config.thinking_config
+    assert thinking.include_thoughts is False
+    assert thinking.thinking_budget == 0
+
+
+# ---------------------------------------------------------------------------
+# Multimodal input
+# ---------------------------------------------------------------------------
+
+PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAA="
+
+
+def test_input_image_data_url_becomes_inline_data():
+    client, llm = make_adk_client([text_turn("A pixel.")])
+    r = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "What is this?"},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{PNG_B64}",
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200
+    parts = llm.requests[0].contents[-1].parts
+    assert parts[0].text == "What is this?"
+    blob = parts[1].inline_data
+    assert blob is not None
+    assert blob.mime_type == "image/png"
+    assert len(blob.data) > 0
+
+
+def test_input_image_http_url_becomes_file_data():
+    client, llm = make_adk_client([text_turn("A cat.")])
+    client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/cat.jpg",
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    file_data = llm.requests[0].contents[-1].parts[1].file_data
+    assert file_data is not None
+    assert file_data.file_uri == "https://example.com/cat.jpg"
+    assert file_data.mime_type == "image/jpeg"
+
+
+def test_input_file_base64_becomes_inline_data():
+    client, llm = make_adk_client([text_turn("A doc.")])
+    client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Summarize"},
+                        {
+                            "type": "input_file",
+                            "filename": "notes.pdf",
+                            "file_data": PNG_B64,
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    blob = llm.requests[0].contents[-1].parts[1].inline_data
+    assert blob is not None
+    assert blob.mime_type == "application/pdf"
+
+
+def test_multimodal_history_replay_preserves_images():
+    client, llm = make_adk_client([text_turn("Still a pixel.")])
+    client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "look"},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{PNG_B64}",
+                        },
+                    ],
+                },
+                {"type": "message", "role": "assistant", "content": "A pixel."},
+                {"type": "message", "role": "user", "content": "sure?"},
+            ]
+        },
+    )
+    contents = llm.requests[0].contents
+    image_parts = [
+        p for c in contents for p in (c.parts or []) if p.inline_data is not None
+    ]
+    assert len(image_parts) == 1
+
+
+# ---------------------------------------------------------------------------
+# max_tool_calls / allowed_tools enforcement / finish reasons
+# ---------------------------------------------------------------------------
+
+
+def test_max_tool_calls_marks_response_incomplete():
+    calls = {"n": 0}
+
+    def counter() -> dict:
+        """Counts."""
+        calls["n"] += 1
+        return {"n": calls["n"]}
+
+    client, _ = make_adk_client(
+        [
+            call_turn("counter", {}),
+            call_turn("counter", {}),
+            text_turn("done"),
+        ],
+        tools=[counter],
+    )
+    body = client.post(
+        "/v1/responses", json={"input": "count twice", "max_tool_calls": 1}
+    ).json()
+    assert body["status"] == "incomplete"
+    assert body["incomplete_details"] == {"reason": "max_tool_calls"}
+    # first call went through, second was cut off
+    assert calls["n"] >= 1
+    receipts = [i for i in body["output"] if i["type"] == "adk:function_call"]
+    assert len(receipts) == 1
+
+
+def test_allowed_tools_blocks_disallowed_internal_tool():
+    executed = {"secret": False}
+
+    def secret_tool() -> dict:
+        """Does something secret."""
+        executed["secret"] = True
+        return {"ok": True}
+
+    client, _ = make_adk_client(
+        [call_turn("secret_tool", {}), text_turn("I could not use that tool.")],
+        tools=[get_weather, secret_tool],
+    )
+    r = client.post(
+        "/v1/responses",
+        json={
+            "input": "use the secret tool",
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [{"type": "function", "name": "get_weather"}],
+            },
+        },
+    )
+    assert r.status_code == 200
+    assert executed["secret"] is False  # execution was suppressed
+
+
+def test_max_tokens_finish_reason_marks_incomplete():
+    truncated = [
+        LlmResponse(
+            partial=False,
+            content=types.Content(
+                role="model", parts=[types.Part(text="Once upon a")]
+            ),
+            finish_reason=types.FinishReason.MAX_TOKENS,
+            usage_metadata=usage(),
+        )
+    ]
+    client, _ = make_adk_client([truncated])
+    body = client.post(
+        "/v1/responses", json={"input": "tell a story", "max_output_tokens": 5}
+    ).json()
+    assert body["status"] == "incomplete"
+    assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert body["output"][0]["content"][0]["text"] == "Once upon a"

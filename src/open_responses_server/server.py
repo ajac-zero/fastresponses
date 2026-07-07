@@ -17,6 +17,7 @@ Implements the core Open Responses surface:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -46,9 +47,20 @@ from .store import InMemoryResponseStore, ResponseStore, StoredResponse
 
 WS_LOCAL_CACHE_LIMIT = 32
 
+# WebSocket connections are limited to 60 minutes per the specification.
+WS_CONNECTION_LIMIT_SECONDS = 60 * 60
+
 # HTTP/SSE transport-specific fields that must not be part of a WebSocket
 # response.create message body.
 _WS_STRIPPED_FIELDS = ("type", "stream", "stream_options", "background")
+
+
+def _event_json(event) -> str:
+    """Serialize a streaming event, omitting the obfuscation key when unset."""
+    data = event.model_dump()
+    if data.get("obfuscation") is None:
+        data.pop("obfuscation", None)
+    return json.dumps(data, separators=(",", ":"))
 
 
 class ApiError(Exception):
@@ -79,6 +91,7 @@ def create_app(
     store: ResponseStore | None = None,
     api_key: str | None = None,
     title: str | None = None,
+    ws_connection_limit_seconds: float = WS_CONNECTION_LIMIT_SECONDS,
 ) -> FastAPI:
     """Build a FastAPI app serving ``adapter`` over the Open Responses API.
 
@@ -88,12 +101,16 @@ def create_app(
             Defaults to an in-memory store.
         api_key: If set, requests must carry ``Authorization: Bearer <api_key>``.
         title: OpenAPI title for the app.
+        ws_connection_limit_seconds: Maximum WebSocket connection lifetime;
+            when reached the server sends a ``websocket_connection_limit_reached``
+            error envelope and closes the socket (spec: 60 minutes).
     """
     response_store = store or InMemoryResponseStore()
     engine = ResponseEngine(adapter, response_store)
     app = FastAPI(title=title or f"Open Responses ({adapter.name})")
     app.state.adapter = adapter
     app.state.response_store = response_store
+    app.state.background_tasks = set()
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -157,15 +174,50 @@ def create_app(
             previous_state=previous_state,
         )
 
+    async def _start_background(run: AgentRun) -> Response:
+        """Start a response in the background; returns the queued snapshot."""
+        events = engine.events(run)
+        first = await events.__anext__()  # response.created
+        response: Response = first.response  # type: ignore[union-attr]
+        queued = response.model_copy(deep=True)
+        queued.status = "queued"
+        await response_store.put(
+            StoredResponse(response=queued, input_items=run.context_items)
+        )
+
+        async def drain() -> None:
+            try:
+                async for _ in events:
+                    pass
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        task = asyncio.create_task(drain())
+        app.state.background_tasks.add(task)
+        task.add_done_callback(app.state.background_tasks.discard)
+        return queued
+
     @app.post("/v1/responses")
     async def create_response(payload: ResponsesRequest, request: Request):
         await _authorize(request)
         if payload.background:
-            raise ApiError(
-                "Background responses are not supported by this server.",
-                code="unsupported_parameter",
-                param="background",
-            )
+            if payload.stream:
+                raise ApiError(
+                    "Streaming background responses are not supported; poll "
+                    "GET /v1/responses/{id} instead.",
+                    code="unsupported_parameter",
+                    param="stream",
+                )
+            if payload.store is False:
+                raise ApiError(
+                    "Background responses require 'store' to be true.",
+                    code="invalid_value",
+                    param="store",
+                )
+            run = await _build_run(payload)
+            queued = await _start_background(run)
+            return JSONResponse(content=queued.model_dump())
+
         run = await _build_run(payload)
 
         if payload.stream:
@@ -335,9 +387,7 @@ def create_app(
                 continue
             if failed and isinstance(event, ResponseFailedEvent):
                 continue
-            await websocket.send_text(
-                json.dumps(event.model_dump(), separators=(",", ":"))
-            )
+            await websocket.send_text(_event_json(event))
 
         if failed:
             # A failed continuation turn must evict the referenced response
@@ -373,10 +423,29 @@ def create_app(
         # Connection-local continuation state: enables previous_response_id
         # with store=false on the same socket without persisting anything.
         local_cache: OrderedDict[str, StoredResponse] = OrderedDict()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ws_connection_limit_seconds
         try:
             while True:
-                raw = await websocket.receive_text()
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=remaining
+                )
                 await _ws_turn(websocket, raw, local_cache)
+        except TimeoutError:
+            await _ws_error(
+                websocket,
+                status=408,
+                code="websocket_connection_limit_reached",
+                message=(
+                    "This WebSocket connection reached its maximum lifetime; "
+                    "open a new connection to continue."
+                ),
+                error_type="invalid_request",
+            )
+            await websocket.close(code=1000)
         except WebSocketDisconnect:
             return
 
@@ -393,6 +462,5 @@ def _type_for_status(status: int) -> str:
 async def _sse(events: AsyncIterator) -> AsyncIterator[str]:
     """Frame streaming events as Server-Sent Events."""
     async for event in events:
-        data = json.dumps(event.model_dump(), separators=(",", ":"))
-        yield f"event: {event.type}\ndata: {data}\n\n"
+        yield f"event: {event.type}\ndata: {_event_json(event)}\n\n"
     yield "data: [DONE]\n\n"

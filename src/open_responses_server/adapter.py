@@ -90,6 +90,19 @@ class ItemDone:
 
 
 @dataclass
+class Incomplete:
+    """The turn ended early (token budget, tool-call limit, ...).
+
+    The engine closes open items with status ``incomplete`` and finishes the
+    response with status ``incomplete`` and ``incomplete_details.reason``.
+    Adapters should stop emitting content after this event (state/usage
+    events are still processed).
+    """
+
+    reason: str = "max_output_tokens"
+
+
+@dataclass
 class UsageDelta:
     """Token accounting; values are summed across events."""
 
@@ -112,7 +125,13 @@ class StateUpdate:
 
 
 AdapterEvent = Union[
-    TextDelta, ReasoningDelta, ItemAdded, ItemDone, UsageDelta, StateUpdate
+    TextDelta,
+    ReasoningDelta,
+    ItemAdded,
+    ItemDone,
+    Incomplete,
+    UsageDelta,
+    StateUpdate,
 ]
 
 

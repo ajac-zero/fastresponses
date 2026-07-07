@@ -9,6 +9,7 @@ persistence into the response store.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -17,6 +18,7 @@ from .adapter import (
     AdapterError,
     AgentAdapter,
     AgentRun,
+    Incomplete,
     ItemAdded,
     ItemDone,
     ReasoningDelta,
@@ -32,6 +34,7 @@ from .models import (
     FunctionCallArgumentsDeltaEvent,
     FunctionCallArgumentsDoneEvent,
     FunctionCallItem,
+    IncompleteDetails,
     MessageItem,
     OutputItemAddedEvent,
     OutputItemDoneEvent,
@@ -43,14 +46,17 @@ from .models import (
     ReasoningSummaryPartDoneEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningSummaryTextDoneEvent,
+    ReasoningField,
     Response,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseError,
     ResponseFailedEvent,
+    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     StreamEvent,
     SummaryText,
+    TextField,
     Usage,
     new_message_id,
     new_reasoning_id,
@@ -58,6 +64,16 @@ from .models import (
 from .store import ResponseStore, StoredResponse
 
 logger = logging.getLogger(__name__)
+
+_OBFUSCATION_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_OBFUSCATION_BUCKET = 16
+
+
+def _obfuscation(delta: str) -> str:
+    """Random padding so that ``len(delta) + len(obfuscation)`` falls on a
+    fixed bucket boundary, mitigating token-length side channels."""
+    pad = -len(delta) % _OBFUSCATION_BUCKET
+    return "".join(random.choices(_OBFUSCATION_ALPHABET, k=pad))
 
 
 class ResponseEngine:
@@ -98,6 +114,8 @@ class ResponseEngine:
                     case ItemDone(item=item):
                         for ev in state.on_item_done(item):
                             yield ev
+                    case Incomplete(reason=reason):
+                        state.incomplete_reason = reason
                     case UsageDelta() as usage:
                         state.on_usage(usage)
                     case StateUpdate(state=adapter_state):
@@ -116,14 +134,26 @@ class ResponseEngine:
                 yield ev
             return
 
-        for ev in state.close_open_items():
+        incomplete = state.incomplete_reason is not None
+        for ev in state.close_open_items(
+            status="incomplete" if incomplete else "completed"
+        ):
             yield ev
 
-        response = state.snapshot(status="completed")
+        if incomplete:
+            response = state.snapshot(status="incomplete")
+            response.incomplete_details = IncompleteDetails(
+                reason=state.incomplete_reason
+            )
+        else:
+            response = state.snapshot(status="completed")
         stored = await self._persist(state, response)
         if on_stored is not None:
             await on_stored(stored)
-        yield state.stamp(ResponseCompletedEvent(response=response))
+        if incomplete:
+            yield state.stamp(ResponseIncompleteEvent(response=response))
+        else:
+            yield state.stamp(ResponseCompletedEvent(response=response))
 
     async def _fail(
         self,
@@ -188,11 +218,18 @@ class _TurnState:
         self.has_usage = False
 
         request = run.request
+        self.incomplete_reason: str | None = None
+        self.obfuscate = (
+            request.stream_options.include_obfuscation
+            if request.stream_options is not None
+            else True
+        )
         self.response_template = Response(
             model=request.model or adapter.default_model or adapter.name,
             instructions=request.instructions,
             previous_response_id=request.previous_response_id,
             store=request.store if request.store is not None else True,
+            background=bool(request.background),
             tools=request.tools,
             tool_choice=request.tool_choice,
             parallel_tool_calls=(
@@ -202,10 +239,31 @@ class _TurnState:
             ),
             temperature=request.temperature if request.temperature is not None else 1.0,
             top_p=request.top_p if request.top_p is not None else 1.0,
+            presence_penalty=request.presence_penalty or 0.0,
+            frequency_penalty=request.frequency_penalty or 0.0,
+            top_logprobs=request.top_logprobs or 0,
             max_output_tokens=request.max_output_tokens,
+            max_tool_calls=request.max_tool_calls,
+            reasoning=(
+                ReasoningField(
+                    effort=request.reasoning.effort,
+                    summary=request.reasoning.summary,
+                )
+                if request.reasoning is not None
+                else None
+            ),
+            text=(
+                TextField.model_validate(
+                    request.text.model_dump(by_alias=True, exclude_none=True)
+                )
+                if request.text is not None
+                else TextField()
+            ),
             truncation=request.truncation or "disabled",
             metadata=request.metadata or {},
             service_tier=request.service_tier or "default",
+            safety_identifier=request.safety_identifier or request.user,
+            prompt_cache_key=request.prompt_cache_key,
         )
 
         # Open assistant message being streamed, if any.
@@ -273,12 +331,13 @@ class _TurnState:
                     output_index=self._message_index,
                     content_index=0,
                     delta=delta,
+                    obfuscation=_obfuscation(delta) if self.obfuscate else None,
                 )
             )
         )
         return events
 
-    def close_message(self) -> list[StreamEvent]:
+    def close_message(self, status: str = "completed") -> list[StreamEvent]:
         if self._message is None:
             return []
         message = self._message
@@ -287,7 +346,7 @@ class _TurnState:
         self._message = None
         self._message_text = ""
 
-        message.status = "completed"
+        message.status = status  # type: ignore[assignment]
         message.content = [OutputText(text=text)]
         # While a message is open no other item can be appended, so the
         # reserved index is always the tail of the output list.
@@ -357,7 +416,7 @@ class _TurnState:
             )
         return events
 
-    def close_reasoning(self) -> list[StreamEvent]:
+    def close_reasoning(self, status: str = "completed") -> list[StreamEvent]:
         if self._reasoning is None:
             return []
         reasoning = self._reasoning
@@ -366,7 +425,7 @@ class _TurnState:
         self._reasoning = None
         self._reasoning_text = ""
 
-        reasoning.status = "completed"
+        reasoning.status = status  # type: ignore[assignment]
         reasoning.summary = [SummaryText(text=text)] if text else []
         # While a reasoning item is open no other item can be appended, so
         # the reserved index is always the tail of the output list.
@@ -404,9 +463,9 @@ class _TurnState:
         )
         return events
 
-    def close_open_items(self) -> list[StreamEvent]:
+    def close_open_items(self, status: str = "completed") -> list[StreamEvent]:
         """Close whichever streamed item (reasoning or message) is open."""
-        return [*self.close_reasoning(), *self.close_message()]
+        return [*self.close_reasoning(status), *self.close_message(status)]
 
     def on_item_added(self, item: Any) -> list[StreamEvent]:
         events = self.close_open_items()

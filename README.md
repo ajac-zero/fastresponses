@@ -21,7 +21,8 @@ zero custom integration.
 - **WebSocket transport** at the same `/v1/responses` resource: sequential
   `response.create` turns, connection-local `previous_response_id` continuation
   (works with `store: false` / zero data retention), `previous_response_not_found`
-  error envelopes, and cache eviction on failed continuation turns.
+  error envelopes, cache eviction on failed continuation turns, and the
+  spec's 60-minute connection lifetime (`websocket_connection_limit_reached`).
 - **`previous_response_id` continuation** — conversations map to persistent ADK
   sessions, so history is not re-sent to the model. Stateless replay (full
   transcript in `input`) also works.
@@ -35,8 +36,27 @@ zero custom integration.
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
   as `encrypted_content` when available.
-- `instructions`, `temperature`, `top_p`, `max_output_tokens`, `tool_choice`
-  (`auto` / `required` / `none` / forced function / `allowed_tools`) mapped to ADK.
+- `instructions`, `temperature`, `top_p`, `presence_penalty`,
+  `frequency_penalty`, `top_logprobs`, `max_output_tokens`, and `tool_choice`
+  (`auto` / `required` / `none` / forced function / `allowed_tools`) mapped to
+  ADK. `allowed_tools` is enforced server-side as a hard constraint: calls to
+  tools outside the allowed set are suppressed before execution.
+- **Multimodal input**: `input_image` and `input_file` parts (data URLs,
+  base64 file data, or remote URLs) are translated to genai `inline_data` /
+  `file_data` parts — in fresh input and in replayed history.
+- **Structured output**: `text.format` `json_schema` / `json_object` map to
+  the model's native JSON-schema-constrained decoding.
+- **`reasoning.effort` / `reasoning.summary`** map to a genai `ThinkingConfig`
+  (thinking budget by effort level, thought summaries on request).
+- **`max_tool_calls`** is enforced mid-run: when the model exceeds the budget
+  the turn stops with status `incomplete` and
+  `incomplete_details.reason: "max_tool_calls"`; token exhaustion
+  (`MAX_TOKENS`) likewise yields `incomplete` with reason
+  `max_output_tokens`. Incomplete responses stay continuable.
+- **`background: true`**: returns a `queued` response immediately and executes
+  the turn asynchronously; poll `GET /v1/responses/{id}` for the result.
+- **Obfuscation padding** on `response.output_text.delta` events (on by
+  default, disable with `stream_options.include_obfuscation: false`).
 - **`POST /v1/responses/compact`** — compacts a conversation into a single
   round-trippable `compaction` item that can seed a new response chain.
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `store: false`, usage
@@ -195,10 +215,14 @@ pass, covering both HTTP and WebSocket transports.
 
 ## Current limitations
 
-- Text-only input (`input_image` / `input_file` parts are ignored).
-- `background: true` is not implemented.
-- WebSocket connections have no 60-minute lifetime cap yet
-  (`websocket_connection_limit_reached` is never emitted).
+- `background: true` returns a `queued` snapshot and runs the turn
+  asynchronously; intermediate `in_progress` snapshots are not persisted, and
+  `background` cannot be combined with `stream` (poll `GET /v1/responses/{id}`).
+- `include: ["message.output_text.logprobs"]` is accepted but logprob arrays
+  stay empty (ADK does not surface per-token logprobs in its event stream; the
+  request maps to `response_logprobs` on the model call).
+- The WebSocket connection lifetime cap is enforced between turns, not
+  mid-turn.
 - Thought signatures arriving after the reasoning block has closed in the stream
   are not attached to output (the full-fidelity trace lives in the ADK session,
   so continuation never depends on the client echoing `encrypted_content` back).

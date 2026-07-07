@@ -262,6 +262,54 @@ ToolChoice = Union[
 # ---------------------------------------------------------------------------
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    include_obfuscation: bool = True
+
+
+class ReasoningParam(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    summary: Literal["concise", "detailed", "auto"] | None = None
+
+
+class TextResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"] = "text"
+
+
+class JsonSchemaResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    type: Literal["json_schema"] = "json_schema"
+    name: str | None = None
+    description: str | None = None
+    json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
+    strict: bool | None = None
+
+
+class JsonObjectResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["json_object"] = "json_object"
+
+
+ResponseFormat = Annotated[
+    Union[TextResponseFormat, JsonSchemaResponseFormat, JsonObjectResponseFormat],
+    Field(union_mode="left_to_right"),
+]
+
+
+class TextParam(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    format: ResponseFormat | None = None
+    verbosity: Literal["low", "medium", "high"] | None = None
+
+
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -269,7 +317,9 @@ class ResponsesRequest(BaseModel):
     input: str | list[Item] = Field(default_factory=list)
     instructions: str | None = None
     previous_response_id: str | None = None
+    include: list[str] | None = None
     stream: bool | None = False
+    stream_options: StreamOptions | None = None
     store: bool | None = True
     background: bool | None = False
     tools: list[Tool] = Field(default_factory=list)
@@ -277,10 +327,18 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: bool | None = True
     temperature: float | None = None
     top_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    top_logprobs: int | None = None
     max_output_tokens: int | None = None
+    max_tool_calls: int | None = None
+    reasoning: ReasoningParam | None = None
+    text: TextParam | None = None
     truncation: Literal["auto", "disabled"] | None = None
     metadata: dict[str, str] | None = None
     user: str | None = None
+    safety_identifier: str | None = None
+    prompt_cache_key: str | None = None
     service_tier: str | None = None
 
     def input_items(self) -> list[Item]:
@@ -490,6 +548,9 @@ class OutputTextDeltaEvent(BaseModel):
     content_index: int
     delta: str
     logprobs: list[Any] = Field(default_factory=list)
+    obfuscation: str | None = None
+    """Padding to normalize payload sizes; omitted from serialized events
+    when ``stream_options.include_obfuscation`` is false."""
 
 
 class OutputTextDoneEvent(BaseModel):
