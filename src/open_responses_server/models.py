@@ -38,6 +38,10 @@ def new_call_id() -> str:
     return _id("call")
 
 
+def new_reasoning_id() -> str:
+    return _id("rs")
+
+
 # ---------------------------------------------------------------------------
 # Content parts
 # ---------------------------------------------------------------------------
@@ -440,6 +444,50 @@ class OutputTextDoneEvent(BaseModel):
     logprobs: list[Any] = Field(default_factory=list)
 
 
+class ReasoningSummaryPartAddedEvent(BaseModel):
+    type: Literal["response.reasoning_summary_part.added"] = (
+        "response.reasoning_summary_part.added"
+    )
+    sequence_number: int = 0
+    item_id: str
+    output_index: int
+    summary_index: int
+    part: SummaryText
+
+
+class ReasoningSummaryPartDoneEvent(BaseModel):
+    type: Literal["response.reasoning_summary_part.done"] = (
+        "response.reasoning_summary_part.done"
+    )
+    sequence_number: int = 0
+    item_id: str
+    output_index: int
+    summary_index: int
+    part: SummaryText
+
+
+class ReasoningSummaryTextDeltaEvent(BaseModel):
+    type: Literal["response.reasoning_summary_text.delta"] = (
+        "response.reasoning_summary_text.delta"
+    )
+    sequence_number: int = 0
+    item_id: str
+    output_index: int
+    summary_index: int
+    delta: str
+
+
+class ReasoningSummaryTextDoneEvent(BaseModel):
+    type: Literal["response.reasoning_summary_text.done"] = (
+        "response.reasoning_summary_text.done"
+    )
+    sequence_number: int = 0
+    item_id: str
+    output_index: int
+    summary_index: int
+    text: str
+
+
 class FunctionCallArgumentsDeltaEvent(BaseModel):
     type: Literal["response.function_call_arguments.delta"] = (
         "response.function_call_arguments.delta"
@@ -480,6 +528,10 @@ StreamEvent = Union[
     ContentPartDoneEvent,
     OutputTextDeltaEvent,
     OutputTextDoneEvent,
+    ReasoningSummaryPartAddedEvent,
+    ReasoningSummaryPartDoneEvent,
+    ReasoningSummaryTextDeltaEvent,
+    ReasoningSummaryTextDoneEvent,
     FunctionCallArgumentsDeltaEvent,
     FunctionCallArgumentsDoneEvent,
     ErrorEvent,

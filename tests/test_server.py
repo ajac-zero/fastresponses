@@ -3,6 +3,7 @@ from __future__ import annotations
 from open_responses_server.adapter import (
     AdapterError,
     ItemDone,
+    ReasoningDelta,
     StateUpdate,
     TextDelta,
     UsageDelta,
@@ -230,6 +231,86 @@ def test_api_key_auth():
         headers={"Authorization": "Bearer sekret"},
     )
     assert ok.status_code == 200
+
+
+def reasoning_script(run):
+    yield ReasoningDelta(delta="Considering ")
+    yield ReasoningDelta(delta="the question.")
+    yield ReasoningDelta(encrypted_content="c2lnbmF0dXJl")
+    yield TextDelta("The answer is 42.")
+
+
+def test_reasoning_item_non_streaming():
+    client, _ = make_client(reasoning_script)
+    body = client.post("/v1/responses", json={"input": "hi"}).json()
+    assert body["status"] == "completed"
+
+    reasoning = body["output"][0]
+    assert reasoning["type"] == "reasoning"
+    assert reasoning["id"].startswith("rs_")
+    assert reasoning["status"] == "completed"
+    assert reasoning["summary"] == [
+        {"type": "summary_text", "text": "Considering the question."}
+    ]
+    assert reasoning["encrypted_content"] == "c2lnbmF0dXJl"
+
+    message = body["output"][1]
+    assert message["type"] == "message"
+    assert message["content"][0]["text"] == "The answer is 42."
+
+
+def test_reasoning_streaming_events():
+    client, _ = make_client(reasoning_script)
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "hi", "stream": True}
+    ) as r:
+        events = read_sse(r)
+    payloads = [e for e in events if isinstance(e, dict)]
+    types = [e["type"] for e in payloads]
+    assert types == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",  # reasoning
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.done",
+        "response.output_item.done",  # reasoning
+        "response.output_item.added",  # message
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",  # message
+        "response.completed",
+    ]
+    assert [e["sequence_number"] for e in payloads] == list(range(len(payloads)))
+
+    deltas = [
+        e["delta"]
+        for e in payloads
+        if e["type"] == "response.reasoning_summary_text.delta"
+    ]
+    assert deltas == ["Considering ", "the question."]
+    summary_done = next(
+        e for e in payloads if e["type"] == "response.reasoning_summary_text.done"
+    )
+    assert summary_done["text"] == "Considering the question."
+
+    reasoning_done = payloads[8]
+    assert reasoning_done["item"]["type"] == "reasoning"
+    assert reasoning_done["item"]["encrypted_content"] == "c2lnbmF0dXJl"
+    # ids consistent across the reasoning lifecycle
+    rs_id = payloads[2]["item"]["id"]
+    assert all(
+        e["item_id"] == rs_id
+        for e in payloads
+        if e["type"].startswith("response.reasoning_summary")
+    )
+    # final response carries both items
+    final = payloads[-1]["response"]
+    assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
 
 
 def failing_script(run):

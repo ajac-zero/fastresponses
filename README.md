@@ -27,6 +27,10 @@ zero custom integration.
 - **Agent-internal tools** (functions owned by the ADK agent) run server-side and
   are surfaced as `adk:function_call` extension items — a receipt of what happened,
   per the spec's guidance for internally-hosted tools.
+- **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
+  surfaced as `reasoning` output items with streamed
+  `response.reasoning_summary_text.delta` events; thought signatures are attached
+  as `encrypted_content` when available.
 - `instructions`, `temperature`, `top_p`, `max_output_tokens`, `tool_choice`
   (`auto` / `required` / `none` / forced function / `allowed_tools`) mapped to ADK.
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `store: false`, usage
@@ -167,8 +171,10 @@ drive a real ADK `Runner` with a scripted `BaseLlm` (no API key needed).
 ## Current limitations
 
 - Text-only input (`input_image` / `input_file` parts are ignored).
-- Reasoning ("thought") content is not yet surfaced as `reasoning` items.
 - `background: true` and WebSocket transport are not implemented.
+- Thought signatures arriving after the reasoning block has closed in the stream
+  are not attached to output (the full-fidelity trace lives in the ADK session,
+  so continuation never depends on the client echoing `encrypted_content` back).
 - The response store and ADK sessions are in-memory; horizontal scaling needs a
   shared `ResponseStore` and ADK `SessionService` implementation.
 - If a request's `input` ends with `function_call_output` items, those resume the

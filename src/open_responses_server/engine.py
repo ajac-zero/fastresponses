@@ -18,6 +18,7 @@ from .adapter import (
     AgentRun,
     ItemAdded,
     ItemDone,
+    ReasoningDelta,
     StateUpdate,
     TextDelta,
     UsageDelta,
@@ -35,6 +36,11 @@ from .models import (
     OutputText,
     OutputTextDeltaEvent,
     OutputTextDoneEvent,
+    ReasoningItem,
+    ReasoningSummaryPartAddedEvent,
+    ReasoningSummaryPartDoneEvent,
+    ReasoningSummaryTextDeltaEvent,
+    ReasoningSummaryTextDoneEvent,
     Response,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
@@ -42,8 +48,10 @@ from .models import (
     ResponseFailedEvent,
     ResponseInProgressEvent,
     StreamEvent,
+    SummaryText,
     Usage,
     new_message_id,
+    new_reasoning_id,
 )
 from .store import ResponseStore, StoredResponse
 
@@ -69,6 +77,9 @@ class ResponseEngine:
                         if delta:
                             for ev in state.on_text_delta(delta):
                                 yield ev
+                    case ReasoningDelta() as reasoning:
+                        for ev in state.on_reasoning_delta(reasoning):
+                            yield ev
                     case ItemAdded(item=item):
                         for ev in state.on_item_added(item):
                             yield ev
@@ -93,7 +104,7 @@ class ResponseEngine:
                 yield ev
             return
 
-        for ev in state.close_message():
+        for ev in state.close_open_items():
             yield ev
 
         response = state.snapshot(status="completed")
@@ -177,6 +188,10 @@ class _TurnState:
         self._message: MessageItem | None = None
         self._message_index = -1
         self._message_text = ""
+        # Open reasoning item being streamed, if any.
+        self._reasoning: ReasoningItem | None = None
+        self._reasoning_index = -1
+        self._reasoning_text = ""
         # Non-message items that were added but not yet done, keyed by id.
         self._open_items: dict[str, int] = {}
 
@@ -191,13 +206,15 @@ class _TurnState:
         response = self.response_template.model_copy(deep=True)
         response.status = status  # type: ignore[assignment]
         response.output = list(self.output)
+        if self._reasoning is not None:
+            response.output.append(self._reasoning.model_copy(deep=True))
         if self._message is not None:
             response.output.append(self._message.model_copy(deep=True))
         response.usage = self.usage if self.has_usage else None
         return response
 
     def on_text_delta(self, delta: str) -> list[StreamEvent]:
-        events: list[StreamEvent] = []
+        events: list[StreamEvent] = self.close_reasoning()
         if self._message is None:
             self._message = MessageItem(
                 id=new_message_id(), role="assistant", status="in_progress", content=[]
@@ -272,8 +289,101 @@ class _TurnState:
             ),
         ]
 
+    def on_reasoning_delta(self, delta: ReasoningDelta) -> list[StreamEvent]:
+        events: list[StreamEvent] = self.close_message()
+        if self._reasoning is None:
+            self._reasoning = ReasoningItem(
+                id=new_reasoning_id(), status="in_progress", summary=[]
+            )
+            self._reasoning_index = len(self.output)
+            self._reasoning_text = ""
+            events.append(
+                self.stamp(
+                    OutputItemAddedEvent(
+                        output_index=self._reasoning_index,
+                        item=self._reasoning.model_copy(deep=True),
+                    )
+                )
+            )
+            events.append(
+                self.stamp(
+                    ReasoningSummaryPartAddedEvent(
+                        item_id=self._reasoning.id or "",
+                        output_index=self._reasoning_index,
+                        summary_index=0,
+                        part=SummaryText(text=""),
+                    )
+                )
+            )
+        if delta.encrypted_content is not None:
+            self._reasoning.encrypted_content = delta.encrypted_content
+        if delta.delta:
+            self._reasoning_text += delta.delta
+            events.append(
+                self.stamp(
+                    ReasoningSummaryTextDeltaEvent(
+                        item_id=self._reasoning.id or "",
+                        output_index=self._reasoning_index,
+                        summary_index=0,
+                        delta=delta.delta,
+                    )
+                )
+            )
+        return events
+
+    def close_reasoning(self) -> list[StreamEvent]:
+        if self._reasoning is None:
+            return []
+        reasoning = self._reasoning
+        index = self._reasoning_index
+        text = self._reasoning_text
+        self._reasoning = None
+        self._reasoning_text = ""
+
+        reasoning.status = "completed"
+        reasoning.summary = [SummaryText(text=text)] if text else []
+        # While a reasoning item is open no other item can be appended, so
+        # the reserved index is always the tail of the output list.
+        self.output.append(reasoning)
+
+        item_id = reasoning.id or ""
+        events: list[StreamEvent] = []
+        if text:
+            events.append(
+                self.stamp(
+                    ReasoningSummaryTextDoneEvent(
+                        item_id=item_id,
+                        output_index=index,
+                        summary_index=0,
+                        text=text,
+                    )
+                )
+            )
+            events.append(
+                self.stamp(
+                    ReasoningSummaryPartDoneEvent(
+                        item_id=item_id,
+                        output_index=index,
+                        summary_index=0,
+                        part=SummaryText(text=text),
+                    )
+                )
+            )
+        events.append(
+            self.stamp(
+                OutputItemDoneEvent(
+                    output_index=index, item=reasoning.model_copy(deep=True)
+                )
+            )
+        )
+        return events
+
+    def close_open_items(self) -> list[StreamEvent]:
+        """Close whichever streamed item (reasoning or message) is open."""
+        return [*self.close_reasoning(), *self.close_message()]
+
     def on_item_added(self, item: Any) -> list[StreamEvent]:
-        events = self.close_message()
+        events = self.close_open_items()
         index = len(self.output)
         self.output.append(item)
         if getattr(item, "id", None):
@@ -290,7 +400,7 @@ class _TurnState:
             index = self._open_items.pop(item_id)
             self.output[index] = item
         else:
-            events.extend(self.close_message())
+            events.extend(self.close_open_items())
             index = len(self.output)
             self.output.append(item)
             events.append(

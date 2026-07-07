@@ -213,6 +213,92 @@ def test_client_tool_yields_control_and_resumes():
     assert fr_parts and fr_parts[0].response == {"time": "12:00"}
 
 
+def thought_part(text: str, signature: bytes | None = None) -> types.Part:
+    part = types.Part(text=text)
+    part.thought = True
+    if signature is not None:
+        part.thought_signature = signature
+    return part
+
+
+def test_streamed_thoughts_become_reasoning_item():
+    turn = [
+        LlmResponse(
+            partial=True,
+            content=types.Content(role="model", parts=[thought_part("Let me think. ")]),
+        ),
+        LlmResponse(
+            partial=True,
+            content=types.Content(role="model", parts=[thought_part("Tokyo is in Japan.")]),
+        ),
+        LlmResponse(
+            partial=True,
+            content=types.Content(role="model", parts=[types.Part(text="It is sunny.")]),
+        ),
+        LlmResponse(
+            partial=False,
+            content=types.Content(
+                role="model",
+                parts=[
+                    thought_part("Let me think. Tokyo is in Japan."),
+                    types.Part(text="It is sunny."),
+                ],
+            ),
+            usage_metadata=usage(),
+        ),
+    ]
+    client, _ = make_adk_client([turn])
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "weather?", "stream": True}
+    ) as r:
+        events = read_sse(r)
+    payloads = [e for e in events if isinstance(e, dict)]
+
+    reasoning_deltas = [
+        e["delta"]
+        for e in payloads
+        if e["type"] == "response.reasoning_summary_text.delta"
+    ]
+    assert reasoning_deltas == ["Let me think. ", "Tokyo is in Japan."]
+    text_deltas = [
+        e["delta"] for e in payloads if e["type"] == "response.output_text.delta"
+    ]
+    assert text_deltas == ["It is sunny."]
+
+    final = payloads[-1]["response"]
+    assert [item["type"] for item in final["output"]] == ["reasoning", "message"]
+    assert final["output"][0]["summary"] == [
+        {"type": "summary_text", "text": "Let me think. Tokyo is in Japan."}
+    ]
+    assert final["output"][1]["content"][0]["text"] == "It is sunny."
+
+
+def test_unstreamed_thoughts_and_signature_in_final_event():
+    turn = [
+        LlmResponse(
+            partial=False,
+            content=types.Content(
+                role="model",
+                parts=[
+                    thought_part("Weighing options.", signature=b"\x01\x02"),
+                    types.Part(text="Go with option A."),
+                ],
+            ),
+            usage_metadata=usage(),
+        ),
+    ]
+    client, _ = make_adk_client([turn])
+    body = client.post("/v1/responses", json={"input": "which option?"}).json()
+
+    reasoning = body["output"][0]
+    assert reasoning["type"] == "reasoning"
+    assert reasoning["summary"] == [
+        {"type": "summary_text", "text": "Weighing options."}
+    ]
+    assert reasoning["encrypted_content"] == "AQI="  # base64 of \x01\x02
+    assert body["output"][1]["content"][0]["text"] == "Go with option A."
+
+
 def test_previous_response_id_reuses_session_history():
     client, llm = make_adk_client(
         [text_turn("Blue."), text_turn("Because of Rayleigh scattering.")]

@@ -53,6 +53,20 @@ class TextDelta:
 
 
 @dataclass
+class ReasoningDelta:
+    """A chunk of reasoning summary text for the current reasoning item.
+
+    The engine opens a ``reasoning`` output item on the first delta and
+    closes it when any other output (message text, items) begins. When
+    ``encrypted_content`` is set it is attached to the open reasoning item
+    (e.g. provider-opaque thought signatures for lossless round-tripping).
+    """
+
+    delta: str = ""
+    encrypted_content: str | None = None
+
+
+@dataclass
 class ItemAdded:
     """A non-message output item has started (e.g. a tool call receipt).
 
@@ -97,7 +111,9 @@ class StateUpdate:
     state: dict[str, Any] = field(default_factory=dict)
 
 
-AdapterEvent = Union[TextDelta, ItemAdded, ItemDone, UsageDelta, StateUpdate]
+AdapterEvent = Union[
+    TextDelta, ReasoningDelta, ItemAdded, ItemDone, UsageDelta, StateUpdate
+]
 
 
 class AdapterError(Exception):

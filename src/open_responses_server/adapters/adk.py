@@ -4,6 +4,9 @@ Wraps a :class:`google.adk.agents.LlmAgent` (or any ``BaseAgent``) as an
 Open Responses provider:
 
 - Assistant text is streamed as ``output_text`` deltas (ADK ``StreamingMode.SSE``).
+- Model "thought" parts (e.g. Gemini thought summaries) are surfaced as
+  ``reasoning`` output items with streamed summary text; thought signatures
+  are attached as ``encrypted_content`` when available.
 - Tools owned by the ADK agent run *inside* the provider; each execution is
   surfaced as an ``adk:function_call`` extension item (a "receipt" per the
   Open Responses spec for internally-hosted tools).
@@ -19,6 +22,7 @@ Open Responses provider:
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -39,6 +43,7 @@ from ..adapter import (
     AgentRun,
     ItemAdded,
     ItemDone,
+    ReasoningDelta,
     StateUpdate,
     TextDelta,
     UsageDelta,
@@ -57,6 +62,10 @@ from ..models import (
 )
 
 EXTENSION_FUNCTION_CALL = "adk:function_call"
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
 
 
 class ClientFunctionTool(BaseTool):
@@ -427,6 +436,7 @@ class _EventTranslator:
         self.client_tool_names = client_tool_names
         self.call_map = call_map
         self._streamed_chars = 0
+        self._streamed_thought_chars = 0
         self._open_calls: dict[str, CustomItem] = {}
 
     def translate(self, event: Event) -> list[AdapterEvent]:
@@ -442,12 +452,24 @@ class _EventTranslator:
 
         if event.partial:
             for part in parts:
-                if part.text and not part.thought and not part.function_call:
+                if not part.text or part.function_call:
+                    continue
+                if part.thought:
+                    self._streamed_thought_chars += len(part.text)
+                    out.append(ReasoningDelta(delta=part.text))
+                    if part.thought_signature:
+                        out.append(
+                            ReasoningDelta(
+                                encrypted_content=_b64(part.thought_signature)
+                            )
+                        )
+                else:
                     self._streamed_chars += len(part.text)
                     out.append(TextDelta(part.text))
             return out
 
         # Final (aggregated) event for this step.
+        out.extend(self._final_reasoning(parts))
         text = "".join(
             p.text for p in parts if p.text and not p.thought and not p.function_call
         )
@@ -479,6 +501,30 @@ class _EventTranslator:
                     cached_tokens=usage.cached_content_token_count or 0,
                 )
             )
+        return out
+
+    def _final_reasoning(self, parts: list[types.Part]) -> list[AdapterEvent]:
+        """Reasoning ("thought") handling for a final aggregated event.
+
+        Thought text not already streamed via partial chunks is emitted now.
+        A thought signature is attached as ``encrypted_content`` while the
+        reasoning block is still open; if the block was already closed by
+        streamed answer text, the signature is dropped (the full-fidelity
+        trace lives in the ADK session, so continuation does not depend on
+        the client echoing it back).
+        """
+        out: list[AdapterEvent] = []
+        thought_text = "".join(p.text for p in parts if p.text and p.thought)
+        signature = next(
+            (p.thought_signature for p in parts if p.thought_signature), None
+        )
+        if thought_text and self._streamed_thought_chars == 0:
+            out.append(ReasoningDelta(delta=thought_text))
+            if signature:
+                out.append(ReasoningDelta(encrypted_content=_b64(signature)))
+        elif signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0:
+            out.append(ReasoningDelta(encrypted_content=_b64(signature)))
+        self._streamed_thought_chars = 0
         return out
 
     def _yield_client_call(self, fc: types.FunctionCall, args: str) -> ItemDone:
