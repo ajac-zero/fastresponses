@@ -18,6 +18,10 @@ zero custom integration.
 
 - **`POST /v1/responses`** with JSON responses or spec-compliant SSE streaming
   (semantic events, `sequence_number`, item/content-part lifecycles, `data: [DONE]`).
+- **WebSocket transport** at the same `/v1/responses` resource: sequential
+  `response.create` turns, connection-local `previous_response_id` continuation
+  (works with `store: false` / zero data retention), `previous_response_not_found`
+  error envelopes, and cache eviction on failed continuation turns.
 - **`previous_response_id` continuation** — conversations map to persistent ADK
   sessions, so history is not re-sent to the model. Stateless replay (full
   transcript in `input`) also works.
@@ -37,8 +41,9 @@ zero custom integration.
   round-trippable `compaction` item that can seed a new response chain.
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `store: false`, usage
   accounting, structured error envelopes, optional bearer-token auth.
-- **Passes the official Open Responses acceptance tests** (all HTTP-transport
-  tests of the [compliance suite](https://www.openresponses.org/compliance)).
+- **Passes the full official Open Responses acceptance suite** — all 17 tests
+  (HTTP and WebSocket transports) of the
+  [compliance suite](https://www.openresponses.org/compliance).
 
 ## Install
 
@@ -185,14 +190,15 @@ uv run pytest -m compliance
 
 It needs `bun` on PATH and network access on the first run (the spec repo is
 pinned and cached under `.compliance/`; pin a different revision with
-`OPENRESPONSES_SPEC_REF`). Without `bun` the test skips itself. All
-HTTP-transport tests pass; WebSocket-transport tests are excluded because the
-WebSocket transport is not implemented.
+`OPENRESPONSES_SPEC_REF`). Without `bun` the test skips itself. All 17 tests
+pass, covering both HTTP and WebSocket transports.
 
 ## Current limitations
 
 - Text-only input (`input_image` / `input_file` parts are ignored).
-- `background: true` and WebSocket transport are not implemented.
+- `background: true` is not implemented.
+- WebSocket connections have no 60-minute lifetime cap yet
+  (`websocket_connection_limit_reached` is never emitted).
 - Thought signatures arriving after the reasoning block has closed in the stream
   are not attached to output (the full-fidelity trace lives in the ADK session,
   so continuation never depends on the client echoing `encrypted_content` back).

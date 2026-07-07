@@ -5,6 +5,12 @@ Implements the core Open Responses surface:
 - ``POST /v1/responses`` — create a response (``application/json`` or,
   with ``"stream": true``, ``text/event-stream`` semantic events terminated
   by ``data: [DONE]``).
+- ``WS /v1/responses`` — WebSocket transport: ``response.create`` messages
+  answered with the same streaming events, one in-flight response at a time,
+  with connection-local ``previous_response_id`` continuation (including
+  ``store: false``) and eviction on failed continuation turns.
+- ``POST /v1/responses/compact`` — compact a conversation into a
+  round-trippable ``compaction`` item.
 - ``GET /v1/responses/{response_id}`` — retrieve a stored response.
 - ``DELETE /v1/responses/{response_id}`` — delete a stored response.
 """
@@ -12,11 +18,13 @@ Implements the core Open Responses surface:
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
 from .adapter import AgentAdapter, AgentRun
 from .compaction import compact_items
@@ -26,11 +34,21 @@ from .models import (
     CompactResource,
     ErrorBody,
     ErrorEnvelope,
+    ErrorEvent,
+    ErrorPayload,
     Item,
     Response,
+    ResponseFailedEvent,
     ResponsesRequest,
+    WebSocketErrorEvent,
 )
-from .store import InMemoryResponseStore, ResponseStore
+from .store import InMemoryResponseStore, ResponseStore, StoredResponse
+
+WS_LOCAL_CACHE_LIMIT = 32
+
+# HTTP/SSE transport-specific fields that must not be part of a WebSocket
+# response.create message body.
+_WS_STRIPPED_FIELDS = ("type", "stream", "stream_options", "background")
 
 
 class ApiError(Exception):
@@ -109,12 +127,19 @@ def create_app(
                 status_code=401,
             )
 
-    async def _build_run(payload: ResponsesRequest) -> AgentRun:
+    async def _build_run(
+        payload: ResponsesRequest,
+        local_cache: OrderedDict[str, StoredResponse] | None = None,
+    ) -> AgentRun:
         new_items: list[Item] = payload.input_items()
         context_items: list[Item] = list(new_items)
         previous_state = None
         if payload.previous_response_id:
-            stored = await response_store.get(payload.previous_response_id)
+            stored = None
+            if local_cache is not None:
+                stored = local_cache.get(payload.previous_response_id)
+            if stored is None:
+                stored = await response_store.get(payload.previous_response_id)
             if stored is None:
                 raise ApiError(
                     f"Previous response with id '{payload.previous_response_id}' "
@@ -207,7 +232,162 @@ def create_app(
     async def health():
         return {"status": "ok", "adapter": adapter.name}
 
+    # ------------------------------------------------------------------
+    # WebSocket transport
+    # ------------------------------------------------------------------
+
+    async def _ws_error(
+        websocket: WebSocket,
+        *,
+        status: int,
+        code: str,
+        message: str,
+        error_type: str | None = None,
+        param: str | None = None,
+    ) -> None:
+        event = WebSocketErrorEvent(
+            status=status,
+            error=ErrorPayload(
+                type=error_type or _type_for_status(status),
+                code=code,
+                message=message,
+                param=param,
+            ),
+        )
+        await websocket.send_text(
+            json.dumps(event.model_dump(exclude_none=True), separators=(",", ":"))
+        )
+
+    async def _ws_turn(
+        websocket: WebSocket,
+        raw: str,
+        local_cache: OrderedDict[str, StoredResponse],
+    ) -> None:
+        """Process a single response.create message on the connection."""
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            await _ws_error(
+                websocket,
+                status=400,
+                code="invalid_json",
+                message="WebSocket message was not valid JSON.",
+            )
+            return
+        if not isinstance(payload, dict) or payload.get("type") != "response.create":
+            await _ws_error(
+                websocket,
+                status=400,
+                code="invalid_value",
+                message="WebSocket messages must be 'response.create' events.",
+                param="type",
+            )
+            return
+
+        body = {k: v for k, v in payload.items() if k not in _WS_STRIPPED_FIELDS}
+        try:
+            request_model = ResponsesRequest.model_validate(body)
+        except ValidationError as exc:
+            first = exc.errors()[0] if exc.errors() else {}
+            await _ws_error(
+                websocket,
+                status=400,
+                code="invalid_value",
+                message=str(first.get("msg", "Invalid request body.")),
+                param=".".join(str(p) for p in first.get("loc", [])) or None,
+            )
+            return
+
+        previous_id = request_model.previous_response_id
+        try:
+            run = await _build_run(request_model, local_cache=local_cache)
+        except ApiError as exc:
+            await _ws_error(
+                websocket,
+                status=exc.status_code,
+                code=exc.body.code or exc.body.type,
+                message=exc.body.message,
+                error_type=exc.body.type,
+                param=exc.body.param,
+            )
+            return
+
+        stored_holder: list[StoredResponse] = []
+
+        async def on_stored(stored: StoredResponse) -> None:
+            stored_holder.append(stored)
+
+        failed = False
+        async for event in engine.events(run, on_stored=on_stored):
+            if isinstance(event, ErrorEvent):
+                # WebSocket failures are sent as a single error envelope
+                # instead of the SSE error + response.failed pair.
+                failed = True
+                status = ERROR_STATUS_CODES.get(event.error.type, 500)
+                await _ws_error(
+                    websocket,
+                    status=status,
+                    code=event.error.code or event.error.type,
+                    message=event.error.message,
+                    error_type=event.error.type,
+                    param=event.error.param,
+                )
+                continue
+            if failed and isinstance(event, ResponseFailedEvent):
+                continue
+            await websocket.send_text(
+                json.dumps(event.model_dump(), separators=(",", ":"))
+            )
+
+        if failed:
+            # A failed continuation turn must evict the referenced response
+            # from the connection-local cache.
+            if previous_id:
+                local_cache.pop(previous_id, None)
+            return
+
+        if stored_holder:
+            stored = stored_holder[-1]
+            local_cache[stored.response.id] = stored
+            local_cache.move_to_end(stored.response.id)
+            while len(local_cache) > WS_LOCAL_CACHE_LIMIT:
+                local_cache.popitem(last=False)
+
+    @app.websocket("/v1/responses")
+    async def responses_websocket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        if api_key is not None:
+            header = websocket.headers.get("authorization", "")
+            token = header.removeprefix("Bearer ").strip()
+            if token != api_key:
+                await _ws_error(
+                    websocket,
+                    status=401,
+                    code="invalid_api_key",
+                    message="Incorrect or missing API key.",
+                    error_type="invalid_request",
+                )
+                await websocket.close(code=1008)
+                return
+
+        # Connection-local continuation state: enables previous_response_id
+        # with store=false on the same socket without persisting anything.
+        local_cache: OrderedDict[str, StoredResponse] = OrderedDict()
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                await _ws_turn(websocket, raw, local_cache)
+        except WebSocketDisconnect:
+            return
+
     return app
+
+
+def _type_for_status(status: int) -> str:
+    for error_type, code in ERROR_STATUS_CODES.items():
+        if code == status:
+            return error_type
+    return "invalid_request" if 400 <= status < 500 else "server_error"
 
 
 async def _sse(events: AsyncIterator) -> AsyncIterator[str]:

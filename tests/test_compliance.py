@@ -39,9 +39,8 @@ SPEC_REF = os.environ.get(
 )
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".compliance" / "openresponses"
 
-# All HTTP-transport tests from the suite. WebSocket transport is not
-# implemented by this server (yet), so those tests are excluded.
-HTTP_TESTS = [
+# The full suite: HTTP and WebSocket transports.
+COMPLIANCE_TESTS = [
     "basic-response",
     "assistant-phase",
     "response-output-phase-schema",
@@ -52,6 +51,13 @@ HTTP_TESTS = [
     "multi-turn",
     "compact-response",
     "compact-missing-model",
+    "websocket-response",
+    "websocket-sequential-responses",
+    "websocket-continuation",
+    "websocket-reconnect-store-false-recovery",
+    "websocket-previous-response-not-found",
+    "websocket-failed-continuation-evicts-cache",
+    "websocket-compact-new-chain",
 ]
 
 API_KEY = "compliance-test-key"
@@ -157,7 +163,7 @@ def test_official_compliance_suite(bun: str, spec_repo: Path, server_url: str):
             "compliance-model",
             "--json",
             "--filter",
-            ",".join(HTTP_TESTS),
+            ",".join(COMPLIANCE_TESTS),
         ],
         cwd=spec_repo,
         capture_output=True,
@@ -179,4 +185,4 @@ def test_official_compliance_suite(bun: str, spec_repo: Path, server_url: str):
         for r in failures
     )
     assert not failures, f"compliance failures:\n{details}"
-    assert report["summary"]["passed"] == len(HTTP_TESTS)
+    assert report["summary"]["passed"] == len(COMPLIANCE_TESTS)

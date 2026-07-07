@@ -334,6 +334,10 @@ def test_adapter_error_streaming_emits_error_then_failed():
     payloads = [e for e in events if isinstance(e, dict)]
     types = [e["type"] for e in payloads]
     assert types[-2:] == ["error", "response.failed"]
+    error_event = payloads[-2]
+    assert error_event["error"]["code"] == "boom"
+    assert error_event["error"]["type"] == "model_error"
+    assert error_event["error"]["message"] == "model exploded"
     failed = payloads[-1]["response"]
     assert failed["status"] == "failed"
     assert failed["error"]["code"] == "boom"

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from .adapter import (
@@ -28,6 +28,7 @@ from .models import (
     ContentPartAddedEvent,
     ContentPartDoneEvent,
     ErrorEvent,
+    ErrorPayload,
     FunctionCallArgumentsDeltaEvent,
     FunctionCallArgumentsDoneEvent,
     FunctionCallItem,
@@ -64,8 +65,18 @@ class ResponseEngine:
         self.adapter = adapter
         self.store = store
 
-    async def events(self, run: AgentRun) -> AsyncIterator[StreamEvent]:
-        """Execute one turn, yielding Open Responses streaming events."""
+    async def events(
+        self,
+        run: AgentRun,
+        *,
+        on_stored: Callable[[StoredResponse], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Execute one turn, yielding Open Responses streaming events.
+
+        ``on_stored`` is invoked with the completed :class:`StoredResponse`
+        regardless of the request's ``store`` flag, letting transports keep
+        connection-local continuation state (e.g. WebSocket ``store=false``).
+        """
         state = _TurnState(self.adapter, run)
 
         yield state.stamp(ResponseCreatedEvent(response=state.snapshot()))
@@ -109,7 +120,9 @@ class ResponseEngine:
             yield ev
 
         response = state.snapshot(status="completed")
-        await self._persist(state, response)
+        stored = await self._persist(state, response)
+        if on_stored is not None:
+            await on_stored(stored)
         yield state.stamp(ResponseCompletedEvent(response=response))
 
     async def _fail(
@@ -121,7 +134,13 @@ class ResponseEngine:
         code: str | None = None,
         param: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        yield state.stamp(ErrorEvent(code=code, message=message, param=param))
+        yield state.stamp(
+            ErrorEvent(
+                error=ErrorPayload(
+                    type=error_type, code=code, message=message, param=param
+                )
+            )
+        )
         response = state.snapshot(status="failed")
         response.error = ResponseError.model_validate(
             {
@@ -134,16 +153,15 @@ class ResponseEngine:
         await self._persist(state, response)
         yield state.stamp(ResponseFailedEvent(response=response))
 
-    async def _persist(self, state: _TurnState, response: Response) -> None:
-        if state.run.request.store is False:
-            return
-        await self.store.put(
-            StoredResponse(
-                response=response,
-                input_items=state.run.context_items,
-                adapter_state=state.adapter_state,
-            )
+    async def _persist(self, state: _TurnState, response: Response) -> StoredResponse:
+        stored = StoredResponse(
+            response=response,
+            input_items=state.run.context_items,
+            adapter_state=state.adapter_state,
         )
+        if state.run.request.store is not False:
+            await self.store.put(stored)
+        return stored
 
 
 async def collect_response(events: AsyncIterator[StreamEvent]) -> Response:

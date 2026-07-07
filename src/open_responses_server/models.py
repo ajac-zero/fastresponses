@@ -566,12 +566,27 @@ class FunctionCallArgumentsDoneEvent(BaseModel):
     arguments: str
 
 
-class ErrorEvent(BaseModel):
-    type: Literal["error"] = "error"
-    sequence_number: int = 0
+class ErrorPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "server_error"
     code: str | None = None
     message: str = ""
     param: str | None = None
+
+
+class ErrorEvent(BaseModel):
+    type: Literal["error"] = "error"
+    sequence_number: int = 0
+    error: ErrorPayload = Field(default_factory=ErrorPayload)
+
+
+class WebSocketErrorEvent(BaseModel):
+    """Error envelope for WebSocket transport failures."""
+
+    type: Literal["error"] = "error"
+    status: int = 500
+    error: ErrorPayload = Field(default_factory=ErrorPayload)
 
 
 StreamEvent = Union[
