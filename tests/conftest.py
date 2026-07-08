@@ -28,6 +28,11 @@ class FakeAdapter(AgentAdapter):
     async def run(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
         self.runs.append(run)
         for event in self.script(run):
+            if hasattr(event, "__await__"):
+                # scripts may yield awaitables (e.g. asyncio.sleep) to pace
+                # long-running turns in background/cancellation tests
+                await event
+                continue
             yield event
 
 

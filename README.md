@@ -258,6 +258,24 @@ app = create_app(ADKAdapter(agent), api_key="my-secret")
 # uvicorn.run(app, ...) or mount it in an existing FastAPI project
 ```
 
+## Background responses
+
+`"background": true` runs the turn asynchronously and immediately returns a
+`queued` snapshot. Beyond the basics, the server implements the OpenAI-style
+conveniences:
+
+- **Progressive snapshots** — `GET /v1/responses/{id}` shows `in_progress`
+  status and output items as they complete, not just the final state.
+- **Cancellation** — `POST /v1/responses/{id}/cancel` stops a running
+  background response (`status: "cancelled"`); completed ones are returned
+  unchanged.
+- **Streaming** — `"background": true, "stream": true` returns live SSE
+  backed by a replayable buffer.
+- **Resumable streams** — if the connection drops, resume from the last
+  event you saw: `GET /v1/responses/{id}/events?starting_after=<sequence_number>`
+  replays buffered events from the cursor and follows live until the run
+  finishes.
+
 ## Observability
 
 Every turn emits one structured log record on the
@@ -345,9 +363,8 @@ pass for both adapters, covering both HTTP and WebSocket transports.
 
 ## Current limitations
 
-- `background: true` returns a `queued` snapshot and runs the turn
-  asynchronously; intermediate `in_progress` snapshots are not persisted, and
-  `background` cannot be combined with `stream` (poll `GET /v1/responses/{id}`).
+- Background event buffers (for `GET /v1/responses/{id}/events` resumption)
+  are in-process and bounded to the 64 most recent background runs.
 - `include: ["message.output_text.logprobs"]` is accepted but logprob arrays
   stay empty (ADK does not surface per-token logprobs in its event stream; the
   request maps to `response_logprobs` on the model call).

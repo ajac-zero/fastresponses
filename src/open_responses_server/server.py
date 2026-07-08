@@ -13,14 +13,20 @@ Implements the core Open Responses surface:
   round-trippable ``compaction`` item.
 - ``GET /v1/responses/{response_id}`` — retrieve a stored response.
 - ``DELETE /v1/responses/{response_id}`` — delete a stored response.
+- ``POST /v1/responses/{response_id}/cancel`` — cancel a running
+  background response.
+- ``GET /v1/responses/{response_id}/events`` — replay/resume the event
+  stream of a background response (``?starting_after=<sequence_number>``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -38,8 +44,10 @@ from .models import (
     ErrorEvent,
     ErrorPayload,
     Item,
+    OutputItemDoneEvent,
     Response,
     ResponseFailedEvent,
+    ResponseInProgressEvent,
     ResponsesRequest,
     WebSocketErrorEvent,
 )
@@ -61,6 +69,59 @@ def _event_json(event) -> str:
     if data.get("obfuscation") is None:
         data.pop("obfuscation", None)
     return json.dumps(data, separators=(",", ":"))
+
+
+# Buffered background runs kept for resumable streaming (most recent first
+# to be evicted last).
+BACKGROUND_RUN_BUFFER_LIMIT = 64
+
+
+@dataclass
+class _BackgroundRun:
+    """A background response run with a replayable event buffer.
+
+    Events are buffered as pre-framed SSE strings; ``stream`` replays from a
+    cursor (``sequence_number``) and then follows live until the run ends.
+    """
+
+    response_id: str
+    queued: Response
+    events: list[tuple[int, str, str]] = field(default_factory=list)
+    done: bool = False
+    task: asyncio.Task | None = None
+
+    def __post_init__(self) -> None:
+        self._condition = asyncio.Condition()
+
+    def append(self, event) -> None:
+        self.events.append(
+            (event.sequence_number, event.type, _event_json(event))
+        )
+
+    async def notify(self) -> None:
+        async with self._condition:
+            self._condition.notify_all()
+
+    async def finish(self) -> None:
+        self.done = True
+        await self.notify()
+
+    async def stream(self, *, starting_after: int) -> AsyncIterator[str]:
+        """SSE frames for events with sequence_number > starting_after."""
+        index = 0
+        while True:
+            while index < len(self.events):
+                seq, event_type, payload = self.events[index]
+                index += 1
+                if seq > starting_after:
+                    yield f"event: {event_type}\ndata: {payload}\n\n"
+            if self.done:
+                break
+            async with self._condition:
+                if self.done or index < len(self.events):
+                    continue
+                await self._condition.wait()
+        yield "data: [DONE]\n\n"
 
 
 class ApiError(Exception):
@@ -111,6 +172,7 @@ def create_app(
     app.state.adapter = adapter
     app.state.response_store = response_store
     app.state.background_tasks = set()
+    app.state.background_runs = OrderedDict()
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -174,8 +236,9 @@ def create_app(
             previous_state=previous_state,
         )
 
-    async def _start_background(run: AgentRun) -> Response:
-        """Start a response in the background; returns the queued snapshot."""
+    async def _start_background(run: AgentRun) -> _BackgroundRun:
+        """Start a response in the background; buffers its events for
+        resumable streaming and persists progressive snapshots."""
         events = engine.events(run)
         first = await events.__anext__()  # response.created
         response: Response = first.response  # type: ignore[union-attr]
@@ -185,29 +248,59 @@ def create_app(
             StoredResponse(response=queued, input_items=run.context_items)
         )
 
+        bg = _BackgroundRun(response_id=queued.id, queued=queued)
+        bg.append(first)
+        app.state.background_runs[queued.id] = bg
+        while len(app.state.background_runs) > BACKGROUND_RUN_BUFFER_LIMIT:
+            app.state.background_runs.popitem(last=False)
+
         async def drain() -> None:
+            snapshot = queued.model_copy(deep=True)
+            snapshot.status = "in_progress"
             try:
-                async for _ in events:
-                    pass
+                async for event in events:
+                    bg.append(event)
+                    await bg.notify()
+                    # Persist progressive snapshots so GET shows progress.
+                    if isinstance(event, OutputItemDoneEvent):
+                        snapshot.output.append(event.item)
+                        await response_store.put(
+                            StoredResponse(
+                                response=snapshot.model_copy(deep=True),
+                                input_items=run.context_items,
+                            )
+                        )
+                    elif isinstance(event, ResponseInProgressEvent):
+                        await response_store.put(
+                            StoredResponse(
+                                response=snapshot.model_copy(deep=True),
+                                input_items=run.context_items,
+                            )
+                        )
+            except asyncio.CancelledError:
+                cancelled = snapshot.model_copy(deep=True)
+                cancelled.status = "cancelled"
+                cancelled.completed_at = int(time.time())
+                await response_store.put(
+                    StoredResponse(
+                        response=cancelled, input_items=run.context_items
+                    )
+                )
+                raise
             except Exception:  # pragma: no cover - defensive
                 pass
+            finally:
+                await bg.finish()
 
-        task = asyncio.create_task(drain())
-        app.state.background_tasks.add(task)
-        task.add_done_callback(app.state.background_tasks.discard)
-        return queued
+        bg.task = asyncio.create_task(drain())
+        app.state.background_tasks.add(bg.task)
+        bg.task.add_done_callback(app.state.background_tasks.discard)
+        return bg
 
     @app.post("/v1/responses")
     async def create_response(payload: ResponsesRequest, request: Request):
         await _authorize(request)
         if payload.background:
-            if payload.stream:
-                raise ApiError(
-                    "Streaming background responses are not supported; poll "
-                    "GET /v1/responses/{id} instead.",
-                    code="unsupported_parameter",
-                    param="stream",
-                )
             if payload.store is False:
                 raise ApiError(
                     "Background responses require 'store' to be true.",
@@ -215,8 +308,17 @@ def create_app(
                     param="store",
                 )
             run = await _build_run(payload)
-            queued = await _start_background(run)
-            return JSONResponse(content=queued.model_dump())
+            bg = await _start_background(run)
+            if payload.stream:
+                return StreamingResponse(
+                    bg.stream(starting_after=-1),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return JSONResponse(content=bg.queued.model_dump())
 
         run = await _build_run(payload)
 
@@ -264,6 +366,59 @@ def create_app(
                 param="response_id",
             )
         return JSONResponse(content=stored.response.model_dump())
+
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def cancel_response(response_id: str, request: Request):
+        await _authorize(request)
+        stored = await response_store.get(response_id)
+        if stored is None:
+            raise ApiError(
+                f"Response with id '{response_id}' not found.",
+                type="not_found",
+                code="response_not_found",
+                param="response_id",
+            )
+        if not stored.response.background:
+            raise ApiError(
+                "Only background responses can be cancelled.",
+                code="invalid_value",
+                param="response_id",
+            )
+        bg: _BackgroundRun | None = app.state.background_runs.get(response_id)
+        if (
+            bg is not None
+            and bg.task is not None
+            and not bg.task.done()
+            and stored.response.status in ("queued", "in_progress")
+        ):
+            bg.task.cancel()
+            try:
+                await bg.task
+            except asyncio.CancelledError:
+                pass
+            stored = await response_store.get(response_id) or stored
+        return JSONResponse(content=stored.response.model_dump())
+
+    @app.get("/v1/responses/{response_id}/events")
+    async def stream_response_events(
+        response_id: str, request: Request, starting_after: int = -1
+    ):
+        """Resume the event stream of a background response from a cursor
+        (``starting_after`` is the last ``sequence_number`` received)."""
+        await _authorize(request)
+        bg: _BackgroundRun | None = app.state.background_runs.get(response_id)
+        if bg is None:
+            raise ApiError(
+                f"No streamable background response with id '{response_id}'.",
+                type="not_found",
+                code="response_not_found",
+                param="response_id",
+            )
+        return StreamingResponse(
+            bg.stream(starting_after=starting_after),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.delete("/v1/responses/{response_id}")
     async def delete_response(response_id: str, request: Request):

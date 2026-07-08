@@ -144,13 +144,17 @@ def test_background_requires_store():
     assert r.json()["error"]["param"] == "store"
 
 
-def test_background_rejects_streaming():
+def test_background_streaming_is_supported():
+    # background + stream returns live SSE (buffer-backed, resumable via
+    # GET /v1/responses/{id}/events; covered in test_background_extras.py)
     client, _ = make_client(simple_script)
-    r = client.post(
-        "/v1/responses", json={"input": "hi", "background": True, "stream": True}
-    )
-    assert r.status_code == 400
-    assert r.json()["error"]["param"] == "stream"
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"input": "hi", "background": True, "stream": True},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
 
 
 # ---------------------------------------------------------------------------
