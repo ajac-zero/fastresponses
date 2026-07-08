@@ -195,6 +195,29 @@ app = create_app(ADKAdapter(agent), api_key="my-secret")
 # uvicorn.run(app, ...) or mount it in an existing FastAPI project
 ```
 
+## Persistence
+
+By default responses live in an in-process LRU store, so
+`previous_response_id` continuation does not survive restarts. For a durable
+single-file store (stdlib SQLite, WAL mode, no extra dependencies):
+
+```bash
+open-responses-server serve weather_agent.py:agent --store responses.db
+```
+
+```python
+from open_responses_server import SQLiteResponseStore, create_app
+
+app = create_app(adapter, store=SQLiteResponseStore("responses.db"))
+```
+
+Custom backends (Redis, Postgres, ...) implement the three-method
+`ResponseStore` ABC (`get`/`put`/`delete`). ADK users should pair this with a
+persistent `SessionService` (e.g. `DatabaseSessionService`) passed to
+`ADKAdapter` so framework-side conversation state survives restarts too; the
+Pydantic AI adapter keeps all conversation state in the response store
+already.
+
 ## Writing an adapter for another framework
 
 Implement `AgentAdapter` — an async generator that translates one turn into a
@@ -257,8 +280,11 @@ pass for both adapters, covering both HTTP and WebSocket transports.
 - Thought signatures arriving after the reasoning block has closed in the stream
   are not attached to output (the full-fidelity trace lives in the ADK session,
   so continuation never depends on the client echoing `encrypted_content` back).
-- The response store and ADK sessions are in-memory; horizontal scaling needs a
-  shared `ResponseStore` and ADK `SessionService` implementation.
+- Multi-host deployments need a shared `ResponseStore` implementation (the
+  bundled `SQLiteResponseStore` is single-host; the interface is three async
+  methods, so a Redis/Postgres store is straightforward). For the ADK adapter,
+  pass a shared `SessionService` (e.g. `DatabaseSessionService`) for the same
+  reason.
 - If a request's `input` ends with `function_call_output` items, those resume the
   paused tool call; mixing them with a *later* user message in the same request
   seeds the outputs as history instead.

@@ -109,8 +109,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model name advertised in responses when requests omit 'model'.",
     )
+    serve.add_argument(
+        "--store",
+        default="memory",
+        help="Response store for previous_response_id continuation: 'memory' "
+        "(default, LRU in-process) or a SQLite file path such as "
+        "'responses.db' (durable across restarts).",
+    )
     serve.add_argument("--log-level", default="info")
     return parser
+
+
+def resolve_store(spec: str):
+    from .store import InMemoryResponseStore, SQLiteResponseStore
+
+    if spec == "memory":
+        return InMemoryResponseStore()
+    path = spec.removeprefix("sqlite://").removeprefix("sqlite:")
+    return SQLiteResponseStore(path)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -123,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
         adapter = resolve_adapter(load_target(args.target), model_name=args.model_name)
         if args.model_name:
             adapter.default_model = args.model_name
-        app = create_app(adapter, api_key=args.api_key)
+        app = create_app(adapter, api_key=args.api_key, store=resolve_store(args.store))
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 

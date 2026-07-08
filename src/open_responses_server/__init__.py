@@ -21,7 +21,12 @@ from .adapter import (
 from .cli import main
 from .engine import ResponseEngine, collect_response
 from .server import create_app
-from .store import InMemoryResponseStore, ResponseStore, StoredResponse
+from .store import (
+    InMemoryResponseStore,
+    ResponseStore,
+    SQLiteResponseStore,
+    StoredResponse,
+)
 
 __all__ = [
     "AdapterError",
@@ -35,6 +40,7 @@ __all__ = [
     "ReasoningDelta",
     "ResponseEngine",
     "ResponseStore",
+    "SQLiteResponseStore",
     "StateUpdate",
     "StoredResponse",
     "TextDelta",
