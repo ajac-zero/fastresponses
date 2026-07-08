@@ -84,3 +84,41 @@ def create_agent() -> Agent:
         model=RuleBasedLlm(),
         instruction="Answer deterministically.",
     )
+
+
+def create_pydantic_ai_agent():
+    """Deterministic Pydantic AI agent with the same rule-based behavior."""
+    from pydantic_ai import Agent as PydanticAgent
+    from pydantic_ai.models.function import (
+        AgentInfo,
+        DeltaToolCall,
+        FunctionModel,
+    )
+
+    async def rule_based(messages, info: AgentInfo):
+        pending = any(
+            type(p).__name__ in ("ToolReturnPart", "RetryPromptPart")
+            for m in messages
+            for p in getattr(m, "parts", [])
+        )
+        if info.function_tools and not pending:
+            tool = info.function_tools[0]
+            schema = tool.parameters_json_schema or {}
+            required = schema.get("required") or []
+            args = {name: "San Francisco, CA" for name in required}
+            yield {
+                0: DeltaToolCall(
+                    name=tool.name,
+                    json_args=__import__("json").dumps(args),
+                    tool_call_id="compliance_call_1",
+                )
+            }
+            return
+        yield "Hello from the "
+        yield "compliance agent."
+
+    return PydanticAgent(
+        FunctionModel(stream_function=rule_based, model_name=MODEL_NAME),
+        name="compliance_agent",
+        instructions="Answer deterministically.",
+    )

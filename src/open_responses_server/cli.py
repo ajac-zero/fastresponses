@@ -5,9 +5,9 @@ Usage::
     open-responses-server serve my_module:agent --port 8080
     open-responses-server serve path/to/agent.py:agent --api-key secret
 
-The target may resolve to either an :class:`AgentAdapter` instance or a
-Google ADK ``BaseAgent`` (which is wrapped in an ``ADKAdapter``
-automatically).
+The target may resolve to an :class:`AgentAdapter` instance or a supported
+framework agent (Google ADK ``BaseAgent``, Pydantic AI ``Agent``), which is
+wrapped in the matching adapter automatically.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ def load_target(target: str) -> Any:
 def resolve_adapter(obj: Any, *, model_name: str | None = None) -> AgentAdapter:
     if isinstance(obj, AgentAdapter):
         return obj
+
     try:
         from google.adk.agents import BaseAgent
     except ImportError:
@@ -63,10 +64,22 @@ def resolve_adapter(obj: Any, *, model_name: str | None = None) -> AgentAdapter:
         from .adapters.adk import ADKAdapter
 
         return ADKAdapter(obj, model_name=model_name)
+
+    try:
+        from pydantic_ai import Agent as PydanticAIAgent
+    except ImportError:
+        PydanticAIAgent = None  # type: ignore[assignment]
+    if PydanticAIAgent is not None and isinstance(obj, PydanticAIAgent):
+        from .adapters.pydantic_ai import PydanticAIAdapter
+
+        return PydanticAIAdapter(obj, model_name=model_name)
+
     raise SystemExit(
-        f"Target of type {type(obj).__name__} is neither an AgentAdapter nor a "
-        "google.adk BaseAgent. Install the framework extra (e.g. "
-        "'open-responses-server[adk]') or point at an AgentAdapter instance."
+        f"Target of type {type(obj).__name__} is not an AgentAdapter or a "
+        "supported framework agent (google.adk BaseAgent, pydantic_ai Agent). "
+        "Install the framework extra (e.g. 'open-responses-server[adk]' or "
+        "'open-responses-server[pydantic-ai]') or point at an AgentAdapter "
+        "instance."
     )
 
 

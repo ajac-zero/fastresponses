@@ -20,6 +20,9 @@ open-responses-server = "open_responses_server:main"
 adk = [
     "google-adk>=2.3.0",
 ]
+pydantic-ai = [
+    "pydantic-ai-slim>=2.6.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12.0"]

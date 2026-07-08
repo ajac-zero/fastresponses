@@ -2,15 +2,15 @@
 
 Serve agent frameworks over the [Open Responses](https://www.openresponses.org) API.
 
-Build your agent with the framework you like — **Google ADK** first, more to come —
-and expose it as an Open Responses provider. Any Open Responses / OpenAI Responses
-compatible client (SDKs, UIs, routers, eval harnesses) can then talk to it with
-zero custom integration.
+Build your agent with the framework you like — **Google ADK** and
+**Pydantic AI** today, more to come — and expose it as an Open Responses
+provider. Any Open Responses / OpenAI Responses compatible client (SDKs, UIs,
+routers, eval harnesses) can then talk to it with zero custom integration.
 
 ```
 ┌────────────────────┐   POST /v1/responses    ┌───────────────────────────┐
-│ Open Responses     │ ──────────────────────▶ │ open-responses-server     │
-│ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ ADK agent
+│ Open Responses     │ ──────────────────────▶ │ open-responses-server     │──▶ ADK agent
+│ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ Pydantic AI agent
 └────────────────────┘   JSON or SSE events    └───────────────────────────┘
 ```
 
@@ -68,7 +68,8 @@ zero custom integration.
 ## Install
 
 ```bash
-uv add 'open-responses-server[adk]'
+uv add 'open-responses-server[adk]'          # Google ADK agents
+uv add 'open-responses-server[pydantic-ai]'  # Pydantic AI agents
 ```
 
 ## Quickstart
@@ -115,6 +116,35 @@ print(response.output_text)
 ```
 
 Streaming works the same way (`"stream": true` / `client.responses.create(stream=True)`).
+
+### Pydantic AI
+
+The same works for a Pydantic AI agent — the CLI detects the framework:
+
+```python
+# weather_agent.py
+from pydantic_ai import Agent
+
+agent = Agent("openai:gpt-5.2", instructions="You are a weather assistant.")
+
+@agent.tool_plain
+def get_weather(city: str) -> dict:
+    """Returns the current weather for a city."""
+    return {"city": city, "forecast": "sunny", "temperature_c": 21}
+```
+
+```bash
+open-responses-server serve weather_agent.py:agent --port 8080
+```
+
+Framework mapping notes: client-declared `tools` become an `ExternalToolset`
+(deferred tool calls yield control back to your client), agent-internal tools
+are surfaced as `pydantic_ai:function_call` receipt items, `ThinkingPart`s
+become `reasoning` items (signatures map to `encrypted_content`),
+`previous_response_id` continuation stores the serialized Pydantic AI message
+history, `reasoning.effort` maps to the unified `thinking` setting, and
+`text.format` JSON schemas map to `StructuredDict` output. Both adapters pass
+the full official compliance suite.
 
 ### Multi-turn conversations
 
@@ -202,7 +232,8 @@ drive a real ADK `Runner` with a scripted `BaseLlm` (no API key needed).
 `tests/test_compliance.py` runs the official Open Responses acceptance tests
 (the CLI runner from [openresponses/openresponses](https://github.com/openresponses/openresponses),
 same suite as the [web tester](https://www.openresponses.org/compliance))
-against a local server backed by a deterministic ADK agent:
+against local servers backed by deterministic (offline) agents — once per
+adapter, ADK and Pydantic AI:
 
 ```bash
 uv run pytest -m compliance
@@ -211,7 +242,7 @@ uv run pytest -m compliance
 It needs `bun` on PATH and network access on the first run (the spec repo is
 pinned and cached under `.compliance/`; pin a different revision with
 `OPENRESPONSES_SPEC_REF`). Without `bun` the test skips itself. All 17 tests
-pass, covering both HTTP and WebSocket transports.
+pass for both adapters, covering both HTTP and WebSocket transports.
 
 ## Current limitations
 
