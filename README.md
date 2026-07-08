@@ -3,15 +3,16 @@
 Serve agent frameworks over the [Open Responses](https://www.openresponses.org) API.
 
 Build your agent with the framework you like — **Google ADK**,
-**Pydantic AI**, or **LangGraph** — and expose it as an Open Responses
-provider. Any Open Responses / OpenAI Responses compatible client (SDKs, UIs,
-routers, eval harnesses) can then talk to it with zero custom integration.
+**Pydantic AI**, **LangGraph**, or the **OpenAI Agents SDK** — and expose it
+as an Open Responses provider. Any Open Responses / OpenAI Responses
+compatible client (SDKs, UIs, routers, eval harnesses) can then talk to it
+with zero custom integration.
 
 ```
 ┌────────────────────┐   POST /v1/responses    ┌───────────────────────────┐──▶ ADK agent
 │ Open Responses     │ ──────────────────────▶ │ open-responses-server     │──▶ Pydantic AI agent
 │ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ LangGraph graph
-└────────────────────┘   JSON or SSE events    └───────────────────────────┘
+└────────────────────┘   JSON or SSE events    └───────────────────────────┘──▶ OpenAI Agents SDK
 ```
 
 ## Features
@@ -68,9 +69,10 @@ routers, eval harnesses) can then talk to it with zero custom integration.
 ## Install
 
 ```bash
-uv add 'open-responses-server[adk]'          # Google ADK agents
-uv add 'open-responses-server[pydantic-ai]'  # Pydantic AI agents
-uv add 'open-responses-server[langgraph]'    # LangGraph graphs
+uv add 'open-responses-server[adk]'            # Google ADK agents
+uv add 'open-responses-server[pydantic-ai]'    # Pydantic AI agents
+uv add 'open-responses-server[langgraph]'      # LangGraph graphs
+uv add 'open-responses-server[openai-agents]'  # OpenAI Agents SDK agents
 ```
 
 ## Quickstart
@@ -179,6 +181,33 @@ their tool name; anything else becomes a `human_input` call).
 `allowed_tools` requests are rejected loudly: an arbitrary compiled graph
 offers no hook for the hard enforcement the spec requires. See
 `examples/langgraph_weather_agent.py`.
+
+### OpenAI Agents SDK
+
+```python
+# weather_agent.py
+from agents import Agent, function_tool
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Returns the current weather for a city."""
+    return f"It is sunny in {city}."
+
+agent = Agent(name="weather_agent", model="gpt-5.2", tools=[get_weather])
+```
+
+```bash
+open-responses-server serve weather_agent.py:agent --port 8080
+```
+
+Framework mapping notes: the SDK already speaks Responses items, so mapping
+is nearly direct. Client-declared `tools` become `needs_approval`
+`FunctionTool`s — the model calling one pauses the run with an interruption,
+surfaced as a `function_call` item (native `call_id` preserved); answering
+with `function_call_output` approves it and resumes from the serialized
+`RunState`, handing your output back as the tool result. Agent-internal
+tools surface as `openai_agents:function_call` receipts, and `allowed_tools`
+is enforced hard by wrapping out-of-set tools to refuse execution.
 
 ### Multi-turn conversations
 

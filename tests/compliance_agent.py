@@ -195,3 +195,119 @@ def create_langgraph_adapter():
         )
 
     return LangGraphAdapter(build, model_name=MODEL_NAME)
+
+
+def create_openai_agents_adapter():
+    """Deterministic OpenAI Agents SDK adapter with the same rules."""
+    import json
+
+    import agents as agents_sdk
+    from agents import Agent as SDKAgent
+    from agents.models.interface import Model
+    from openai.types.responses import (
+        Response,
+        ResponseCompletedEvent,
+        ResponseFunctionToolCall,
+        ResponseOutputMessage,
+        ResponseOutputText,
+        ResponseTextDeltaEvent,
+    )
+    from openai.types.responses.response_usage import (
+        InputTokensDetails,
+        OutputTokensDetails,
+        ResponseUsage,
+    )
+
+    from open_responses_server.adapters.openai_agents import OpenAIAgentsAdapter
+
+    agents_sdk.set_tracing_disabled(True)
+
+    class RuleBasedModel(Model):
+        async def get_response(self, *args, **kwargs):  # pragma: no cover
+            raise NotImplementedError
+
+        async def get_retry_advice(self, *args, **kwargs):  # pragma: no cover
+            return None
+
+        async def close(self) -> None:  # pragma: no cover
+            return None
+
+        async def stream_response(
+            self,
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        ):
+            usage = ResponseUsage(
+                input_tokens=7,
+                output_tokens=5,
+                total_tokens=12,
+                input_tokens_details=InputTokensDetails(cached_tokens=0),
+                output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+            )
+            answered = any(
+                isinstance(i, dict) and i.get("type") == "function_call_output"
+                for i in (input if isinstance(input, list) else [])
+            )
+            if tools and not answered:
+                tool = tools[0]
+                schema = getattr(tool, "params_json_schema", None) or {}
+                required = schema.get("required") or []
+                args = {name: "San Francisco, CA" for name in required}
+                output = [
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        call_id="compliance_call_1",
+                        name=tool.name,
+                        arguments=json.dumps(args),
+                        status="completed",
+                    )
+                ]
+            else:
+                text = "Hello from the compliance agent."
+                for i, chunk in enumerate(["Hello from the ", "compliance agent."]):
+                    yield ResponseTextDeltaEvent(
+                        type="response.output_text.delta",
+                        content_index=0,
+                        item_id="msg_1",
+                        output_index=0,
+                        delta=chunk,
+                        logprobs=[],
+                        sequence_number=i,
+                    )
+                output = [
+                    ResponseOutputMessage(
+                        id="msg_1",
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                        content=[
+                            ResponseOutputText(
+                                type="output_text", text=text, annotations=[]
+                            )
+                        ],
+                    )
+                ]
+            yield ResponseCompletedEvent(
+                type="response.completed",
+                response=Response(
+                    id="resp_fake",
+                    created_at=0,
+                    model=MODEL_NAME,
+                    object="response",
+                    output=output,
+                    parallel_tool_calls=False,
+                    tool_choice="auto",
+                    tools=[],
+                    usage=usage,
+                ),
+                sequence_number=99,
+            )
+
+    agent = SDKAgent(name="compliance_agent", model=RuleBasedModel())
+    return OpenAIAgentsAdapter(agent, model_name=MODEL_NAME)
