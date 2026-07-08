@@ -258,6 +258,19 @@ app = create_app(ADKAdapter(agent), api_key="my-secret")
 # uvicorn.run(app, ...) or mount it in an existing FastAPI project
 ```
 
+## Observability
+
+Every turn emits one structured log record on the
+`open_responses_server.turn` logger — status, duration, token usage, output
+item count, and error code, all as fields (`record.turn`) that any
+structured-logging formatter can serialize.
+
+With the `otel` extra (`open-responses-server[otel]`) and an OpenTelemetry
+SDK configured, each turn is additionally wrapped in an
+`open_responses.turn` span carrying the same attributes plus
+`gen_ai.usage.*` token counts. Spans parent to whatever context is active
+when the turn starts, so ASGI auto-instrumentation composes naturally.
+
 ## Persistence
 
 By default responses live in an in-process LRU store, so

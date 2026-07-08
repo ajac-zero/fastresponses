@@ -62,6 +62,7 @@ from .models import (
     new_reasoning_id,
 )
 from .store import ResponseStore, StoredResponse
+from .telemetry import TurnTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,12 @@ class ResponseEngine:
         connection-local continuation state (e.g. WebSocket ``store=false``).
         """
         state = _TurnState(self.adapter, run)
+        telemetry = TurnTelemetry(
+            adapter=self.adapter.name,
+            model=state.response_template.model,
+            response_id=state.response_id,
+        )
+        state.telemetry = telemetry
 
         yield state.stamp(ResponseCreatedEvent(response=state.snapshot()))
         yield state.stamp(ResponseInProgressEvent(response=state.snapshot()))
@@ -150,6 +157,11 @@ class ResponseEngine:
         stored = await self._persist(state, response)
         if on_stored is not None:
             await on_stored(stored)
+        telemetry.finish(
+            status=response.status,
+            usage=response.usage,
+            output_items=len(response.output),
+        )
         if incomplete:
             yield state.stamp(ResponseIncompleteEvent(response=response))
         else:
@@ -181,6 +193,14 @@ class ResponseEngine:
             }
         )
         await self._persist(state, response)
+        if state.telemetry is not None:
+            state.telemetry.finish(
+                status="failed",
+                usage=response.usage,
+                output_items=len(response.output),
+                error_code=code or error_type,
+                error_message=message,
+            )
         yield state.stamp(ResponseFailedEvent(response=response))
 
     async def _persist(self, state: _TurnState, response: Response) -> StoredResponse:
@@ -216,6 +236,7 @@ class _TurnState:
         self.adapter_state: dict[str, Any] = {}
         self.usage = Usage()
         self.has_usage = False
+        self.telemetry: TurnTelemetry | None = None
 
         request = run.request
         self.incomplete_reason: str | None = None
@@ -278,6 +299,10 @@ class _TurnState:
         self._open_items: dict[str, int] = {}
 
     # -- events -------------------------------------------------------------
+
+    @property
+    def response_id(self) -> str:
+        return self.response_template.id
 
     def stamp(self, event: StreamEvent) -> StreamEvent:
         event.sequence_number = self.sequence

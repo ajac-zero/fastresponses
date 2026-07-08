@@ -805,6 +805,9 @@ langgraph = [
 openai-agents = [
     { name = "openai-agents" },
 ]
+otel = [
+    { name = "opentelemetry-api" },
+]
 pydantic-ai = [
     { name = "pydantic-ai-slim" },
 ]
@@ -812,6 +815,7 @@ pydantic-ai = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -823,15 +827,17 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.4.8" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.2.8" },
     { name = "openai-agents", marker = "extra == 'openai-agents'", specifier = ">=0.18.0" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.42.1" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.50.2" },
 ]
-provides-extras = ["adk", "pydantic-ai", "langgraph", "openai-agents"]
+provides-extras = ["adk", "pydantic-ai", "langgraph", "openai-agents", "otel"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "opentelemetry-sdk", specifier = ">=1.42.1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
 ]
