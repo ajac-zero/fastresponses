@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+      - name: Run unit tests
+        run: uv run pytest -q -m "not compliance"
+
+  compliance:
+    name: Open Responses compliance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - uses: oven-sh/setup-bun@v2
+      - name: Cache compliance spec repo
+        uses: actions/cache@v4
+        with:
+          path: .compliance
+          key: compliance-${{ hashFiles('tests/test_compliance.py') }}
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+      - name: Run compliance suite (ADK + Pydantic AI adapters)
+        run: uv run pytest -q -m compliance
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check artifacts
+        run: ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
