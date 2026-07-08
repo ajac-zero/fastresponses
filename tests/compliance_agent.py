@@ -122,3 +122,76 @@ def create_pydantic_ai_agent():
         name="compliance_agent",
         instructions="Answer deterministically.",
     )
+
+
+def create_langgraph_adapter():
+    """Deterministic LangGraph adapter (graph factory) with the same rules."""
+    import json
+
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.prebuilt import create_react_agent
+
+    from open_responses_server.adapters.langgraph import LangGraphAdapter
+
+    class RuleBasedChatModel(BaseChatModel):
+        tool_specs: list = []
+
+        @property
+        def _llm_type(self) -> str:
+            return MODEL_NAME
+
+        def bind_tools(self, tools, **kwargs):
+            self.tool_specs = list(tools)
+            return self
+
+        def _rule_based(self, messages) -> AIMessage:
+            answered = any(isinstance(m, ToolMessage) for m in messages)
+            if self.tool_specs and not answered:
+                spec = self.tool_specs[0]
+                schema = getattr(spec, "args_schema", None) or {}
+                if hasattr(schema, "model_json_schema"):
+                    schema = schema.model_json_schema()
+                required = (schema or {}).get("required") or []
+                args = {name: "San Francisco, CA" for name in required}
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": spec.name, "args": args, "id": "compliance_call_1"}
+                    ],
+                )
+            return AIMessage(content="Hello from the compliance agent.")
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            return ChatResult(
+                generations=[ChatGeneration(message=self._rule_based(messages))]
+            )
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            msg = self._rule_based(messages)
+            usage = {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12}
+            if msg.tool_calls:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="", tool_calls=msg.tool_calls, usage_metadata=usage
+                    )
+                )
+                return
+            for i, chunk in enumerate(["Hello from the ", "compliance agent."]):
+                yield ChatGenerationChunk(message=AIMessageChunk(content=chunk))
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(content="", usage_metadata=usage)
+            )
+
+    def build(client_tools):
+        # Fresh model per request: the compliance CLI runs tests
+        # concurrently and bind_tools state must not leak between runs.
+        return create_react_agent(
+            RuleBasedChatModel(tool_specs=[]),
+            tools=client_tools,
+            checkpointer=InMemorySaver(),
+        )
+
+    return LangGraphAdapter(build, model_name=MODEL_NAME)

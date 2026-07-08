@@ -74,12 +74,21 @@ def resolve_adapter(obj: Any, *, model_name: str | None = None) -> AgentAdapter:
 
         return PydanticAIAdapter(obj, model_name=model_name)
 
+    try:
+        from langgraph.pregel import Pregel
+    except ImportError:
+        Pregel = None  # type: ignore[assignment]
+    if Pregel is not None and isinstance(obj, Pregel):
+        from .adapters.langgraph import LangGraphAdapter
+
+        return LangGraphAdapter(obj, model_name=model_name)
+
     raise SystemExit(
         f"Target of type {type(obj).__name__} is not an AgentAdapter or a "
-        "supported framework agent (google.adk BaseAgent, pydantic_ai Agent). "
-        "Install the framework extra (e.g. 'open-responses-server[adk]' or "
-        "'open-responses-server[pydantic-ai]') or point at an AgentAdapter "
-        "instance."
+        "supported framework agent (google.adk BaseAgent, pydantic_ai Agent, "
+        "compiled LangGraph graph). Install the framework extra (e.g. "
+        "'open-responses-server[adk]', '[pydantic-ai]', or '[langgraph]') or "
+        "point at an AgentAdapter instance."
     )
 
 

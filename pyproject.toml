@@ -36,6 +36,10 @@ adk = [
 pydantic-ai = [
     "pydantic-ai-slim>=2.6.0",
 ]
+langgraph = [
+    "langchain-core>=1.4.8",
+    "langgraph>=1.2.8",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12.0"]

@@ -2,15 +2,15 @@
 
 Serve agent frameworks over the [Open Responses](https://www.openresponses.org) API.
 
-Build your agent with the framework you like — **Google ADK** and
-**Pydantic AI** today, more to come — and expose it as an Open Responses
+Build your agent with the framework you like — **Google ADK**,
+**Pydantic AI**, or **LangGraph** — and expose it as an Open Responses
 provider. Any Open Responses / OpenAI Responses compatible client (SDKs, UIs,
 routers, eval harnesses) can then talk to it with zero custom integration.
 
 ```
-┌────────────────────┐   POST /v1/responses    ┌───────────────────────────┐
-│ Open Responses     │ ──────────────────────▶ │ open-responses-server     │──▶ ADK agent
-│ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ Pydantic AI agent
+┌────────────────────┐   POST /v1/responses    ┌───────────────────────────┐──▶ ADK agent
+│ Open Responses     │ ──────────────────────▶ │ open-responses-server     │──▶ Pydantic AI agent
+│ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ LangGraph graph
 └────────────────────┘   JSON or SSE events    └───────────────────────────┘
 ```
 
@@ -70,6 +70,7 @@ routers, eval harnesses) can then talk to it with zero custom integration.
 ```bash
 uv add 'open-responses-server[adk]'          # Google ADK agents
 uv add 'open-responses-server[pydantic-ai]'  # Pydantic AI agents
+uv add 'open-responses-server[langgraph]'    # LangGraph graphs
 ```
 
 ## Quickstart
@@ -143,8 +144,41 @@ are surfaced as `pydantic_ai:function_call` receipt items, `ThinkingPart`s
 become `reasoning` items (signatures map to `encrypted_content`),
 `previous_response_id` continuation stores the serialized Pydantic AI message
 history, `reasoning.effort` maps to the unified `thinking` setting, and
-`text.format` JSON schemas map to `StructuredDict` output. Both adapters pass
+`text.format` JSON schemas map to `StructuredDict` output. All adapters pass
 the full official compliance suite.
+
+### LangGraph
+
+Any compiled graph following the `MessagesState` convention works:
+
+```python
+# weather_agent.py
+from langchain.agents import create_agent
+
+def get_weather(city: str) -> str:
+    """Returns the current weather for a city."""
+    return f"It is sunny in {city}."
+
+agent = create_agent("openai:gpt-5.2", tools=[get_weather])
+```
+
+```bash
+open-responses-server serve weather_agent.py:agent --port 8080
+```
+
+Framework mapping notes: `previous_response_id` continuation maps to
+checkpointer threads (the adapter attaches a shared `InMemorySaver` when the
+graph has none); graph-internal tools surface as `langgraph:function_call`
+receipts. Client-declared `tools` need a *graph factory* — construct
+`LangGraphAdapter(lambda client_tools: create_agent(model, tools=[...,
+*client_tools]))` — and yield control via `interrupt()`: the adapter turns
+interrupts into `function_call` items and resumes the graph with
+`Command(resume=...)` when the client answers. Human-in-the-loop interrupts
+from your own graph surface the same way (dicts with `name`/`args` keep
+their tool name; anything else becomes a `human_input` call).
+`allowed_tools` requests are rejected loudly: an arbitrary compiled graph
+offers no hook for the hard enforcement the spec requires. See
+`examples/langgraph_weather_agent.py`.
 
 ### Multi-turn conversations
 

@@ -129,16 +129,20 @@ def _install_runtime_deps(bun: str) -> None:
     shutil.move(scratch / "node_modules", target)
 
 
-@pytest.fixture(scope="session", params=["adk", "pydantic_ai"])
+@pytest.fixture(scope="session", params=["adk", "pydantic_ai", "langgraph"])
 def server_url(request):
     if request.param == "adk":
         adapter = ADKAdapter(create_agent(), app_name="compliance")
-    else:
+    elif request.param == "pydantic_ai":
         from open_responses_server.adapters.pydantic_ai import PydanticAIAdapter
 
         from compliance_agent import create_pydantic_ai_agent
 
         adapter = PydanticAIAdapter(create_pydantic_ai_agent())
+    else:
+        from compliance_agent import create_langgraph_adapter
+
+        adapter = create_langgraph_adapter()
     app = create_app(adapter, api_key=API_KEY)
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
