@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from open_responses_server.adapter import (
+from fastresponses.adapter import (
     AdapterError,
     ItemDone,
     ReasoningDelta,
@@ -8,7 +8,7 @@ from open_responses_server.adapter import (
     TextDelta,
     UsageDelta,
 )
-from open_responses_server.models import FunctionCallItem
+from fastresponses.models import FunctionCallItem
 
 from conftest import make_client, read_sse
 

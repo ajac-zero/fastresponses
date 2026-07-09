@@ -19,8 +19,8 @@ from langchain_core.outputs import (  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 from langgraph.prebuilt import create_react_agent  # noqa: E402
 
-from open_responses_server.adapters.langgraph import LangGraphAdapter  # noqa: E402
-from open_responses_server.server import create_app  # noqa: E402
+from fastresponses.adapters.langgraph import LangGraphAdapter  # noqa: E402
+from fastresponses.server import create_app  # noqa: E402
 
 
 class ScriptedChatModel(BaseChatModel):

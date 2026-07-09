@@ -1,5 +1,5 @@
 [project]
-name = "open-responses-server"
+name = "fastresponses"
 version = "0.1.0"
 description = "Serve agent frameworks (Google ADK, Pydantic AI) over the Open Responses API"
 readme = "README.md"
@@ -27,7 +27,7 @@ dependencies = [
 Specification = "https://www.openresponses.org"
 
 [project.scripts]
-open-responses-server = "open_responses_server:main"
+fastresponses = "fastresponses:main"
 
 [project.optional-dependencies]
 adk = [

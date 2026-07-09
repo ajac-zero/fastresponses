@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from open_responses_server.adapter import (
+from fastresponses.adapter import (
     AdapterError,
     StateUpdate,
     TextDelta,
 )
-from open_responses_server.models import FunctionCallOutputItem
+from fastresponses.models import FunctionCallOutputItem
 
 from conftest import make_client
 

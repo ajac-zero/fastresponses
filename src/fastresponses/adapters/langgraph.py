@@ -54,7 +54,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "The LangGraph adapter requires the 'langgraph' extra: "
-        "pip install 'open-responses-server[langgraph]'"
+        "pip install 'fastresponses[langgraph]'"
     ) from exc
 
 from ..adapter import (  # noqa: I001

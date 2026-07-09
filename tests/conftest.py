@@ -5,12 +5,12 @@ from collections.abc import AsyncIterator, Callable, Iterable
 
 from fastapi.testclient import TestClient
 
-from open_responses_server.adapter import (
+from fastresponses.adapter import (
     AdapterEvent,
     AgentAdapter,
     AgentRun,
 )
-from open_responses_server.server import create_app
+from fastresponses.server import create_app
 
 
 class FakeAdapter(AgentAdapter):

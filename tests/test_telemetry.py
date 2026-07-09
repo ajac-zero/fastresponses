@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from open_responses_server.adapter import AdapterError, TextDelta, UsageDelta
+from fastresponses.adapter import AdapterError, TextDelta, UsageDelta
 
 from conftest import make_client
 
@@ -23,7 +23,7 @@ def failing_script(run):
 
 def test_turn_log_record_has_structured_fields(caplog):
     client, _ = make_client(script)
-    with caplog.at_level(logging.INFO, logger="open_responses_server.turn"):
+    with caplog.at_level(logging.INFO, logger="fastresponses.turn"):
         body = client.post("/v1/responses", json={"input": "hi"}).json()
 
     records = [r for r in caplog.records if hasattr(r, "turn")]
@@ -40,7 +40,7 @@ def test_turn_log_record_has_structured_fields(caplog):
 
 def test_failed_turn_logs_warning_with_error_code(caplog):
     client, _ = make_client(failing_script)
-    with caplog.at_level(logging.INFO, logger="open_responses_server.turn"):
+    with caplog.at_level(logging.INFO, logger="fastresponses.turn"):
         client.post("/v1/responses", json={"input": "hi"})
 
     records = [r for r in caplog.records if hasattr(r, "turn")]
@@ -60,13 +60,13 @@ def test_otel_span_per_turn():
 
     # Install an SDK tracer provider (no-op API otherwise). This is global,
     # so re-fetch the module-level tracer used by telemetry.
-    import open_responses_server.telemetry as telemetry
+    import fastresponses.telemetry as telemetry
 
     exporter = InMemorySpanExporter()
     provider = otel_sdk.TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    telemetry._tracer = trace.get_tracer("open-responses-server")
+    telemetry._tracer = trace.get_tracer("fastresponses")
 
     client, _ = make_client(script)
     body = client.post("/v1/responses", json={"input": "hi"}).json()

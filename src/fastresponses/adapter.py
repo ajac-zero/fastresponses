@@ -3,7 +3,7 @@
 An :class:`AgentAdapter` bridges an agent framework (ADK, LangGraph, ...) to
 the Open Responses protocol. Adapters receive an :class:`AgentRun` describing
 one turn and yield a stream of simple :data:`AdapterEvent` objects. The
-engine (:mod:`open_responses_server.engine`) is responsible for turning those
+engine (:mod:`fastresponses.engine`) is responsible for turning those
 into spec-compliant Open Responses semantic events and the final response
 object, so adapters never have to deal with sequence numbers, content-part
 lifecycles, or SSE framing.

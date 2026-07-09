@@ -63,7 +63,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "The Pydantic AI adapter requires the 'pydantic-ai' extra: "
-        "pip install 'open-responses-server[pydantic-ai]'"
+        "pip install 'fastresponses[pydantic-ai]'"
     ) from exc
 
 from ..adapter import (  # noqa: I001

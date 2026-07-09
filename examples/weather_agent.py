@@ -2,7 +2,7 @@
 
 Run (requires GOOGLE_API_KEY or Vertex AI credentials):
 
-    uv run open-responses-server serve examples/weather_agent.py:agent --port 8080
+    uv run fastresponses serve examples/weather_agent.py:agent --port 8080
 
 Then talk to it with any Open Responses / OpenAI Responses client:
 

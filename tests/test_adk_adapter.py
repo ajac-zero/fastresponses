@@ -11,8 +11,8 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
-from open_responses_server.adapters.adk import ADKAdapter
-from open_responses_server.server import create_app
+from fastresponses.adapters.adk import ADKAdapter
+from fastresponses.server import create_app
 
 from conftest import read_sse
 

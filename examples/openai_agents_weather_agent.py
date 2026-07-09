@@ -2,7 +2,7 @@
 
 Run it (requires the openai-agents extra and ``OPENAI_API_KEY``)::
 
-    open-responses-server serve examples/openai_agents_weather_agent.py:agent
+    fastresponses serve examples/openai_agents_weather_agent.py:agent
 """
 
 from agents import Agent, function_tool

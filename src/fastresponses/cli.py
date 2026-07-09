@@ -2,8 +2,8 @@
 
 Usage::
 
-    open-responses-server serve my_module:agent --port 8080
-    open-responses-server serve path/to/agent.py:agent --api-key secret
+    fastresponses serve my_module:agent --port 8080
+    fastresponses serve path/to/agent.py:agent --api-key secret
 
 The target may resolve to an :class:`AgentAdapter` instance or a supported
 framework agent (Google ADK ``BaseAgent``, Pydantic AI ``Agent``), which is
@@ -96,7 +96,7 @@ def resolve_adapter(obj: Any, *, model_name: str | None = None) -> AgentAdapter:
         f"Target of type {type(obj).__name__} is not an AgentAdapter or a "
         "supported framework agent (google.adk BaseAgent, pydantic_ai Agent, "
         "compiled LangGraph graph, openai-agents Agent). Install the framework "
-        "extra (e.g. 'open-responses-server[adk]', '[pydantic-ai]', "
+        "extra (e.g. 'fastresponses[adk]', '[pydantic-ai]', "
         "'[langgraph]', or '[openai-agents]') or point at an AgentAdapter "
         "instance."
     )
@@ -104,7 +104,7 @@ def resolve_adapter(obj: Any, *, model_name: str | None = None) -> AgentAdapter:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="open-responses-server",
+        prog="fastresponses",
         description="Serve agent frameworks over the Open Responses API.",
     )
     sub = parser.add_subparsers(dest="command", required=True)

@@ -1,4 +1,4 @@
-from open_responses_server.models import (
+from fastresponses.models import (
     CustomItem,
     FunctionCallItem,
     FunctionCallOutputItem,

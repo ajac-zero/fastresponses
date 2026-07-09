@@ -194,7 +194,7 @@ class ADKAdapter(AgentAdapter):
         self,
         agent: BaseAgent,
         *,
-        app_name: str = "open-responses-server",
+        app_name: str = "fastresponses",
         session_service: BaseSessionService | None = None,
         model_name: str | None = None,
     ) -> None:

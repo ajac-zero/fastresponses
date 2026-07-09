@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from open_responses_server.adapter import StateUpdate, TextDelta
-from open_responses_server.models import (
+from fastresponses.adapter import StateUpdate, TextDelta
+from fastresponses.models import (
     FunctionCallItem,
     MessageItem,
     Response,
 )
-from open_responses_server.store import SQLiteResponseStore, StoredResponse
+from fastresponses.store import SQLiteResponseStore, StoredResponse
 
 from conftest import make_client
 

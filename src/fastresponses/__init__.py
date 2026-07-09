@@ -1,4 +1,4 @@
-"""open-responses-server: serve agent frameworks over the Open Responses API.
+"""fastresponses: serve agent frameworks over the Open Responses API.
 
 Wraps agent frameworks (Google ADK first) as providers compatible with the
 Open Responses specification (https://www.openresponses.org), so any Open

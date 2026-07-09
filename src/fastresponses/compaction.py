@@ -27,7 +27,7 @@ def compact_items(items: list[Item]) -> CompactionItem:
         id=new_compaction_id(),
         status="completed",
         encrypted_content=base64.b64encode(payload.encode("utf-8")).decode("ascii"),
-        created_by="open-responses-server",
+        created_by="fastresponses",
     )
 
 

@@ -1,4 +1,4 @@
-# open-responses-server
+# fastresponses
 
 Serve agent frameworks over the [Open Responses](https://www.openresponses.org) API.
 
@@ -10,7 +10,7 @@ with zero custom integration.
 
 ```
 ┌────────────────────┐   POST /v1/responses    ┌───────────────────────────┐──▶ ADK agent
-│ Open Responses     │ ──────────────────────▶ │ open-responses-server     │──▶ Pydantic AI agent
+│ Open Responses     │ ──────────────────────▶ │ fastresponses             │──▶ Pydantic AI agent
 │ client (any SDK)   │ ◀────────────────────── │  engine ─ AgentAdapter ─▶ │──▶ LangGraph graph
 └────────────────────┘   JSON or SSE events    └───────────────────────────┘──▶ OpenAI Agents SDK
 ```
@@ -69,10 +69,10 @@ with zero custom integration.
 ## Install
 
 ```bash
-uv add 'open-responses-server[adk]'            # Google ADK agents
-uv add 'open-responses-server[pydantic-ai]'    # Pydantic AI agents
-uv add 'open-responses-server[langgraph]'      # LangGraph graphs
-uv add 'open-responses-server[openai-agents]'  # OpenAI Agents SDK agents
+uv add 'fastresponses[adk]'            # Google ADK agents
+uv add 'fastresponses[pydantic-ai]'    # Pydantic AI agents
+uv add 'fastresponses[langgraph]'      # LangGraph graphs
+uv add 'fastresponses[openai-agents]'  # OpenAI Agents SDK agents
 ```
 
 ## Quickstart
@@ -97,7 +97,7 @@ agent = Agent(
 Serve it:
 
 ```bash
-open-responses-server serve weather_agent.py:agent --port 8080
+fastresponses serve weather_agent.py:agent --port 8080
 ```
 
 Call it with any Open Responses client:
@@ -137,7 +137,7 @@ def get_weather(city: str) -> dict:
 ```
 
 ```bash
-open-responses-server serve weather_agent.py:agent --port 8080
+fastresponses serve weather_agent.py:agent --port 8080
 ```
 
 Framework mapping notes: client-declared `tools` become an `ExternalToolset`
@@ -165,7 +165,7 @@ agent = create_agent("openai:gpt-5.2", tools=[get_weather])
 ```
 
 ```bash
-open-responses-server serve weather_agent.py:agent --port 8080
+fastresponses serve weather_agent.py:agent --port 8080
 ```
 
 Framework mapping notes: `previous_response_id` continuation maps to
@@ -197,7 +197,7 @@ agent = Agent(name="weather_agent", model="gpt-5.2", tools=[get_weather])
 ```
 
 ```bash
-open-responses-server serve weather_agent.py:agent --port 8080
+fastresponses serve weather_agent.py:agent --port 8080
 ```
 
 Framework mapping notes: the SDK already speaks Responses items, so mapping
@@ -250,8 +250,8 @@ curl http://127.0.0.1:8080/v1/responses -d '{
 ## Embedding in your own app
 
 ```python
-from open_responses_server import create_app
-from open_responses_server.adapters.adk import ADKAdapter
+from fastresponses import create_app
+from fastresponses.adapters.adk import ADKAdapter
 from weather_agent import agent
 
 app = create_app(ADKAdapter(agent), api_key="my-secret")
@@ -279,11 +279,11 @@ conveniences:
 ## Observability
 
 Every turn emits one structured log record on the
-`open_responses_server.turn` logger — status, duration, token usage, output
+`fastresponses.turn` logger — status, duration, token usage, output
 item count, and error code, all as fields (`record.turn`) that any
 structured-logging formatter can serialize.
 
-With the `otel` extra (`open-responses-server[otel]`) and an OpenTelemetry
+With the `otel` extra (`fastresponses[otel]`) and an OpenTelemetry
 SDK configured, each turn is additionally wrapped in an
 `open_responses.turn` span carrying the same attributes plus
 `gen_ai.usage.*` token counts. Spans parent to whatever context is active
@@ -296,11 +296,11 @@ By default responses live in an in-process LRU store, so
 single-file store (stdlib SQLite, WAL mode, no extra dependencies):
 
 ```bash
-open-responses-server serve weather_agent.py:agent --store responses.db
+fastresponses serve weather_agent.py:agent --store responses.db
 ```
 
 ```python
-from open_responses_server import SQLiteResponseStore, create_app
+from fastresponses import SQLiteResponseStore, create_app
 
 app = create_app(adapter, store=SQLiteResponseStore("responses.db"))
 ```
@@ -319,7 +319,7 @@ handful of simple events. The engine handles all protocol mechanics (sequence
 numbers, item/content-part lifecycles, SSE framing, storage):
 
 ```python
-from open_responses_server import AgentAdapter, AgentRun, TextDelta, ItemDone, StateUpdate
+from fastresponses import AgentAdapter, AgentRun, TextDelta, ItemDone, StateUpdate
 
 class MyAdapter(AgentAdapter):
     name = "myfw"            # implementor slug for extension item types

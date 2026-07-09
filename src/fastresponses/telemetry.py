@@ -1,7 +1,7 @@
 """Turn-level observability: structured logs and optional OpenTelemetry spans.
 
 Every turn emits one structured log record on the
-``open_responses_server.turn`` logger with the outcome and token accounting
+``fastresponses.turn`` logger with the outcome and token accounting
 in ``record.__dict__`` (works with any structured-logging formatter).
 
 If ``opentelemetry-api`` is installed (the ``otel`` extra), each turn is
@@ -17,12 +17,12 @@ import logging
 import time
 from typing import Any
 
-logger = logging.getLogger("open_responses_server.turn")
+logger = logging.getLogger("fastresponses.turn")
 
 try:  # pragma: no cover - trivial import branch
     from opentelemetry import trace as _trace
 
-    _tracer = _trace.get_tracer("open-responses-server")
+    _tracer = _trace.get_tracer("fastresponses")
 except ImportError:  # pragma: no cover
     _trace = None
     _tracer = None

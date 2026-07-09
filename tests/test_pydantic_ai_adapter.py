@@ -17,8 +17,8 @@ from pydantic_ai.models.function import (  # noqa: E402
     FunctionModel,
 )
 
-from open_responses_server.adapters.pydantic_ai import PydanticAIAdapter  # noqa: E402
-from open_responses_server.server import create_app  # noqa: E402
+from fastresponses.adapters.pydantic_ai import PydanticAIAdapter  # noqa: E402
+from fastresponses.server import create_app  # noqa: E402
 
 from conftest import read_sse  # noqa: E402
 

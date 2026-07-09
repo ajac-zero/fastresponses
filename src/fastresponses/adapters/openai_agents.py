@@ -41,7 +41,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "The OpenAI Agents SDK adapter requires the 'openai-agents' extra: "
-        "pip install 'open-responses-server[openai-agents]'"
+        "pip install 'fastresponses[openai-agents]'"
     ) from exc
 
 from ..adapter import (  # noqa: I001

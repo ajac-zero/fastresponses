@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 
-from open_responses_server.adapter import (
+from fastresponses.adapter import (
     Incomplete,
     StateUpdate,
     TextDelta,

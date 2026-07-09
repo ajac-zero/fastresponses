@@ -26,10 +26,10 @@ from openai.types.responses.response_usage import (  # noqa: E402
     ResponseUsage,
 )
 
-from open_responses_server.adapters.openai_agents import (  # noqa: E402
+from fastresponses.adapters.openai_agents import (  # noqa: E402
     OpenAIAgentsAdapter,
 )
-from open_responses_server.server import create_app  # noqa: E402
+from fastresponses.server import create_app  # noqa: E402
 
 agents_sdk.set_tracing_disabled(True)
 

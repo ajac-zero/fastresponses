@@ -134,7 +134,7 @@ def create_langgraph_adapter():
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.prebuilt import create_react_agent
 
-    from open_responses_server.adapters.langgraph import LangGraphAdapter
+    from fastresponses.adapters.langgraph import LangGraphAdapter
 
     class RuleBasedChatModel(BaseChatModel):
         tool_specs: list = []
@@ -218,7 +218,7 @@ def create_openai_agents_adapter():
         ResponseUsage,
     )
 
-    from open_responses_server.adapters.openai_agents import OpenAIAgentsAdapter
+    from fastresponses.adapters.openai_agents import OpenAIAgentsAdapter
 
     agents_sdk.set_tracing_disabled(True)
 

@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 import uvicorn
 
-from open_responses_server.adapters.adk import ADKAdapter
-from open_responses_server.server import create_app
+from fastresponses.adapters.adk import ADKAdapter
+from fastresponses.server import create_app
 
 from compliance_agent import create_agent
 
@@ -137,7 +137,7 @@ def server_url(request):
     if request.param == "adk":
         adapter = ADKAdapter(create_agent(), app_name="compliance")
     elif request.param == "pydantic_ai":
-        from open_responses_server.adapters.pydantic_ai import PydanticAIAdapter
+        from fastresponses.adapters.pydantic_ai import PydanticAIAdapter
 
         from compliance_agent import create_pydantic_ai_agent
 

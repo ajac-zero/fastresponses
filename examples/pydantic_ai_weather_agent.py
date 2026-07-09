@@ -3,7 +3,7 @@
 Run it (requires the pydantic-ai extra and a configured model provider,
 e.g. ``OPENAI_API_KEY``)::
 
-    open-responses-server serve examples/pydantic_ai_weather_agent.py:agent
+    fastresponses serve examples/pydantic_ai_weather_agent.py:agent
 
 Then talk to it with any Open Responses / OpenAI Responses client::
 

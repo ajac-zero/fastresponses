@@ -6,8 +6,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-from open_responses_server.adapter import ItemDone, StateUpdate, TextDelta
-from open_responses_server.models import FunctionCallItem
+from fastresponses.adapter import ItemDone, StateUpdate, TextDelta
+from fastresponses.models import FunctionCallItem
 
 from conftest import make_client, read_sse
 
