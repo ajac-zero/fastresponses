@@ -1,18 +1,21 @@
 [project]
 name = "fastresponses"
 version = "0.1.0"
-description = "Serve agent frameworks (Google ADK, Pydantic AI) over the Open Responses API"
+description = "Serve agent frameworks (Google ADK, Pydantic AI, LangGraph, OpenAI Agents SDK) over the Open Responses API"
 readme = "README.md"
 authors = [
     { name = "A8065384", email = "anibal.angulo.cardoza@banorte.com" }
 ]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.13"
-keywords = ["open-responses", "openai", "responses-api", "agents", "adk", "pydantic-ai"]
+requires-python = ">=3.10"
+keywords = ["open-responses", "openai", "responses-api", "agents", "adk", "pydantic-ai", "langgraph"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Framework :: FastAPI",
@@ -24,6 +27,10 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/ajac-zero/fastresponses"
+Repository = "https://github.com/ajac-zero/fastresponses"
+Issues = "https://github.com/ajac-zero/fastresponses/issues"
+Changelog = "https://github.com/ajac-zero/fastresponses/releases"
 Specification = "https://www.openresponses.org"
 
 [project.scripts]
