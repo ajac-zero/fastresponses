@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -30,7 +31,7 @@ from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response as HttpResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .adapter import AgentAdapter, AgentRun
@@ -94,9 +95,7 @@ class _BackgroundRun:
         self._condition = asyncio.Condition()
 
     def append(self, event) -> None:
-        self.events.append(
-            (event.sequence_number, event.type, _event_json(event))
-        )
+        self.events.append((event.sequence_number, event.type, _event_json(event)))
 
     async def notify(self) -> None:
         async with self._condition:
@@ -173,6 +172,7 @@ def create_app(
     app.state.response_store = response_store
     app.state.background_tasks = set()
     app.state.background_runs = OrderedDict()
+    app.state.artifact_registry = getattr(adapter, "artifact_registry", None)
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -282,9 +282,7 @@ def create_app(
                 cancelled.status = "cancelled"
                 cancelled.completed_at = int(time.time())
                 await response_store.put(
-                    StoredResponse(
-                        response=cancelled, input_items=run.context_items
-                    )
+                    StoredResponse(response=cancelled, input_items=run.context_items)
                 )
                 raise
             except Exception:  # pragma: no cover - defensive
@@ -366,6 +364,48 @@ def create_app(
                 param="response_id",
             )
         return JSONResponse(content=stored.response.model_dump())
+
+    @app.get("/v1/artifacts/{artifact_id}/content")
+    async def get_artifact_content(artifact_id: str, request: Request):
+        await _authorize(request)
+        registry = app.state.artifact_registry
+        record = registry.get(artifact_id) if registry is not None else None
+        if record is None:
+            raise ApiError(
+                f"Artifact with id '{artifact_id}' not found.",
+                type="not_found",
+                code="artifact_not_found",
+                param="artifact_id",
+            )
+        part = await record.service.load_artifact(
+            app_name=record.app_name,
+            user_id=record.user_id,
+            session_id=record.session_id,
+            filename=record.filename,
+            version=record.version,
+        )
+        blob = part.inline_data if part is not None else None
+        if blob is None or blob.data is None:
+            raise ApiError(
+                f"Artifact with id '{artifact_id}' not found.",
+                type="not_found",
+                code="artifact_not_found",
+                param="artifact_id",
+            )
+        mime_type = blob.mime_type or record.mime_type
+        if not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime_type or ""):
+            mime_type = "application/octet-stream"
+        safe_filename = re.sub(r"[^A-Za-z0-9._ -]", "_", record.filename)
+        safe_filename = safe_filename.strip(" .") or "artifact"
+        return HttpResponse(
+            content=blob.data,
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     @app.post("/v1/responses/{response_id}/cancel")
     async def cancel_response(response_id: str, request: Request):
