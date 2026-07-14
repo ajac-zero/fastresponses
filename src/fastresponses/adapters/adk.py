@@ -8,8 +8,7 @@ Open Responses provider:
   ``reasoning`` output items with streamed summary text; thought signatures
   are attached as ``encrypted_content`` when available.
 - Tools owned by the ADK agent run *inside* the provider; each execution is
-  surfaced as an ``adk:function_call`` extension item (a "receipt" per the
-  Open Responses spec for internally-hosted tools).
+  surfaced as a standard ``function_call`` / ``function_call_output`` pair.
 - Function tools declared by the *client* in ``request.tools`` are exposed to
   the agent as long-running ADK tools: when the model calls one, the run
   yields control back and the server emits a standard ``function_call``
@@ -23,15 +22,26 @@ Open Responses provider:
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import mimetypes
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.apps import App
+from google.adk.artifacts import (
+    BaseArtifactService,
+    InMemoryArtifactService,
+)
 from google.adk.events import Event
+from google.adk.plugins.save_files_as_artifacts_plugin import (
+    SaveFilesAsArtifactsPlugin,
+)
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, InMemorySessionService, Session
 from google.adk.tools import BaseTool, ToolContext
@@ -50,6 +60,7 @@ from ..adapter import (  # noqa: I001
     TextDelta,
     UsageDelta,
 )
+from ..artifacts import ArtifactRecord, ArtifactRegistry
 from ..compaction import expand_compaction_item
 from ..models import (
     CompactionItem,
@@ -70,11 +81,150 @@ from ..models import (
     new_function_call_id,
 )
 
-EXTENSION_FUNCTION_CALL = "adk:function_call"
+ARTIFACT_TYPE = "ajac-zero:artifact"
+
+
+@dataclass(frozen=True)
+class ADKToolResponse:
+    """Stable context for deriving items from a completed internal ADK tool."""
+
+    name: str
+    arguments: dict[str, Any]
+    response: Any
+    output: str | None
+    author: str
+    call: FunctionCallItem
+    output_item: FunctionCallOutputItem
+    create_artifact: Callable[[str, bytes, str], Awaitable[Item]]
+
+
+InternalToolResponseMapper = Callable[
+    [ADKToolResponse], Iterable[Item] | Awaitable[Iterable[Item]]
+]
 
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+_INPUT_COUNTER_KEY = "fastresponses:input_attachment_counter"
+_MAX_INPUT_FILE_BYTES = 32 * 1024 * 1024
+_MAX_INPUT_FILE_REDIRECTS = 3
+_GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
+
+
+def _validate_input_file_url(url: str, allowed_origins: frozenset[str]) -> httpx.URL:
+    parsed = httpx.URL(url)
+    if parsed.userinfo:
+        raise AdapterError(
+            "Input file URLs must not contain credentials.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.host in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise AdapterError(
+            "Input file URLs must use HTTPS.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    origin = f"{parsed.scheme}://{parsed.host}"
+    if parsed.port is not None:
+        origin += f":{parsed.port}"
+    if origin not in allowed_origins:
+        raise AdapterError(
+            "Input file URL origin is not allowed.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    return parsed
+
+
+def _response_mime_type(response: httpx.Response, filename: str | None) -> str:
+    content_type = response.headers.get("content-type", "")
+    mime_type = content_type.partition(";")[0].strip().lower()
+    if mime_type not in _GENERIC_MIME_TYPES and "/" in mime_type:
+        return mime_type
+    return _guess_mime(filename)
+
+
+async def _fetch_input_file(
+    url: str, filename: str | None, allowed_origins: frozenset[str]
+) -> tuple[bytes, str]:
+    current = _validate_input_file_url(url, allowed_origins)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            for redirects in range(_MAX_INPUT_FILE_REDIRECTS + 1):
+                async with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise AdapterError(
+                                "Input file redirect is missing Location.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        if redirects == _MAX_INPUT_FILE_REDIRECTS:
+                            raise AdapterError(
+                                "Input file exceeded the redirect limit.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        current = _validate_input_file_url(
+                            str(current.join(location)), allowed_origins
+                        )
+                        continue
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise AdapterError(
+                            f"Input file download returned HTTP {response.status_code}.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    declared = response.headers.get("content-length")
+                    if declared is not None and int(declared) > _MAX_INPUT_FILE_BYTES:
+                        raise AdapterError(
+                            "Input file exceeds the maximum size.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > _MAX_INPUT_FILE_BYTES:
+                            raise AdapterError(
+                                "Input file exceeds the maximum size.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        chunks.append(chunk)
+                    if declared is not None and size != int(declared):
+                        raise AdapterError(
+                            "Input file response was truncated.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    return b"".join(chunks), _response_mime_type(response, filename)
+        raise AssertionError("unreachable")
+    except AdapterError:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AdapterError(
+            f"Input file download failed: {exc}",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        ) from exc
 
 
 def _decode_data_url(url: str) -> types.Blob | None:
@@ -113,6 +263,96 @@ def _allowed_tools_guard(allowed: set[str]):
     return guard
 
 
+class _SaveInputFilesAsArtifactsPlugin(SaveFilesAsArtifactsPlugin):
+    """Save uploads under opaque IDs and expose references to the model."""
+
+    async def on_user_message_callback(
+        self, *, invocation_context: Any, user_message: types.Content
+    ) -> types.Content | None:
+        if not user_message.parts:
+            return None
+        new_parts: list[types.Part] = []
+        pending_delta: dict[str, int] = {}
+        modified = False
+        for part in user_message.parts:
+            blob = part.inline_data
+            if blob is None or not blob.display_name:
+                new_parts.append(part)
+                continue
+            mime_type = blob.mime_type or _guess_mime(blob.display_name)
+            counter = int(invocation_context.session.state.get(_INPUT_COUNTER_KEY, 0)) + 1
+            artifact_id = f"attachment_{counter}"
+            version = await invocation_context.artifact_service.save_artifact(
+                app_name=invocation_context.app_name,
+                user_id=invocation_context.user_id,
+                session_id=invocation_context.session.id,
+                filename=artifact_id,
+                artifact=copy.copy(part),
+            )
+            reference = {
+                "artifact_id": artifact_id,
+                "filename": blob.display_name,
+                "mime_type": mime_type,
+            }
+            new_parts.append(
+                types.Part(
+                    text="[Uploaded Artifact: "
+                    + json.dumps(reference, separators=(",", ":"), sort_keys=True)
+                    + "]"
+                )
+            )
+            pending_delta[artifact_id] = version
+            invocation_context.session.state[_INPUT_COUNTER_KEY] = counter
+            modified = True
+        if not modified:
+            return None
+        state = invocation_context.session.state
+        state.setdefault(self.name + ":pending_delta", {})
+        state[self.name + ":pending_delta"] |= pending_delta
+        return types.Content(role=user_message.role, parts=new_parts)
+
+
+async def _save_input_artifacts(
+    parts: list[types.Part],
+    *,
+    artifact_service: BaseArtifactService,
+    app_name: str,
+    user_id: str,
+    session_id: str,
+    counter: int,
+) -> tuple[list[types.Part], int]:
+    """Register named inline files and return model-visible opaque references."""
+    converted: list[types.Part] = []
+    for part in parts:
+        blob = part.inline_data
+        if blob is None or not blob.display_name:
+            converted.append(part)
+            continue
+        mime_type = blob.mime_type or _guess_mime(blob.display_name)
+        counter += 1
+        artifact_id = f"attachment_{counter}"
+        await artifact_service.save_artifact(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            filename=artifact_id,
+            artifact=copy.copy(part),
+        )
+        reference = {
+            "artifact_id": artifact_id,
+            "filename": blob.display_name,
+            "mime_type": mime_type,
+        }
+        converted.append(
+            types.Part(
+                text="[Uploaded Artifact: "
+                + json.dumps(reference, separators=(",", ":"), sort_keys=True)
+                + "]"
+            )
+        )
+    return converted, counter
+
+
 def _content_part_to_adk(part: Any) -> types.Part | None:
     """Translate an Open Responses user content part to a genai Part."""
     if isinstance(part, InputText):
@@ -139,7 +379,9 @@ def _content_part_to_adk(part: Any) -> types.Part | None:
                 return None
             return types.Part(
                 inline_data=types.Blob(
-                    mime_type=_guess_mime(part.filename), data=data
+                    mime_type=part._download_mime_type or _guess_mime(part.filename),
+                    data=data,
+                    display_name=part.filename,
                 )
             )
         if part.file_url:
@@ -179,7 +421,9 @@ class ClientFunctionTool(BaseTool):
             parameters_json_schema=self._parameters,
         )
 
-    async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    async def run_async(
+        self, *, args: dict[str, Any], tool_context: ToolContext
+    ) -> Any:
         # Returning a falsy value from a long-running tool makes ADK skip the
         # function response and end the invocation: control yields back to us.
         return None
@@ -196,12 +440,25 @@ class ADKAdapter(AgentAdapter):
         *,
         app_name: str = "fastresponses",
         session_service: BaseSessionService | None = None,
+        artifact_service: BaseArtifactService | None = None,
         model_name: str | None = None,
+        internal_tool_response_mapper: InternalToolResponseMapper | None = None,
+        input_file_url_origins: Iterable[str] = (),
     ) -> None:
         self.agent = agent
         self.app_name = app_name
         self.session_service = session_service or InMemorySessionService()
+        self.artifact_service = (
+            artifact_service
+            if artifact_service is not None
+            else InMemoryArtifactService()
+        )
+        self.artifact_registry = ArtifactRegistry()
         self.default_model = model_name or self._infer_model_name(agent)
+        self.internal_tool_response_mapper = internal_tool_response_mapper
+        self.input_file_url_origins = frozenset(
+            str(httpx.URL(origin)).rstrip("/") for origin in input_file_url_origins
+        )
 
     @staticmethod
     def _infer_model_name(agent: BaseAgent) -> str:
@@ -219,7 +476,12 @@ class ADKAdapter(AgentAdapter):
         call_map: dict[str, dict[str, str]] = dict(state.get("call_ids") or {})
         user_id: str = state.get("user_id") or run.request.user or "default"
 
-        history, new_message = self._split_input(run.new_items, call_map)
+        hydrated_new = await self._hydrate_input_files(run.new_items)
+        hydrated_context = [
+            *run.context_items[: len(run.context_items) - len(run.new_items)],
+            *hydrated_new,
+        ]
+        history, new_message = self._split_input(hydrated_new, call_map)
 
         session = await self._resolve_session(state, user_id)
         if session is None:
@@ -229,21 +491,35 @@ class ADKAdapter(AgentAdapter):
                 user_id=user_id,
                 session_id=f"or-{uuid.uuid4().hex}",
             )
-            replay = run.context_items[: len(run.context_items) - len(run.new_items)]
+            replay = hydrated_context[: len(hydrated_context) - len(hydrated_new)]
             history = [*replay, *history]
 
         await self._seed_history(session, history, call_map)
 
         client_tools = [ClientFunctionTool(t) for t in run.request.function_tools()]
         agent = self._configure_agent(run, client_tools)
+        app = App(
+            name=self.app_name,
+            root_agent=agent,
+            plugins=[_SaveInputFilesAsArtifactsPlugin()],
+        )
         runner = Runner(
-            agent=agent,
-            app_name=self.app_name,
+            app=app,
             session_service=self.session_service,
+            artifact_service=self.artifact_service,
         )
 
         client_tool_names = {t.name for t in client_tools}
-        translator = _EventTranslator(client_tool_names, call_map)
+        translator = _EventTranslator(
+            client_tool_names,
+            call_map,
+            artifact_service=self.artifact_service,
+            artifact_registry=self.artifact_registry,
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=session.id,
+            internal_tool_response_mapper=self.internal_tool_response_mapper,
+        )
         max_tool_calls = run.request.max_tool_calls
         tool_calls = 0
 
@@ -260,7 +536,7 @@ class ADKAdapter(AgentAdapter):
                         yield Incomplete("max_tool_calls")
                         break
                     tool_calls += pending
-                for adapter_event in translator.translate(event):
+                for adapter_event in await translator.translate(event):
                     yield adapter_event
         except AdapterError:
             raise
@@ -278,6 +554,36 @@ class ADKAdapter(AgentAdapter):
     # ------------------------------------------------------------------
     # Input translation
     # ------------------------------------------------------------------
+
+    async def _hydrate_input_files(self, items: list[Item]) -> list[Item]:
+        hydrated: list[Item] = []
+        for item in items:
+            if not isinstance(item, MessageItem) or not isinstance(item.content, list):
+                hydrated.append(item)
+                continue
+            content: list[Any] = []
+            for part in item.content:
+                if not isinstance(part, InputFile) or not part.file_url:
+                    content.append(part)
+                    continue
+                data, mime_type = await _fetch_input_file(
+                    part.file_url, part.filename, self.input_file_url_origins
+                )
+                filename = part.filename
+                if not filename:
+                    extension = mimetypes.guess_extension(mime_type) or ".bin"
+                    filename = f"attachment{extension}"
+                downloaded = part.model_copy(
+                    update={
+                        "filename": filename,
+                        "file_url": None,
+                        "file_data": _b64(data),
+                    }
+                )
+                downloaded._download_mime_type = mime_type
+                content.append(downloaded)
+            hydrated.append(item.model_copy(update={"content": content}))
+        return hydrated
 
     def _split_input(
         self, items: list[Item], call_map: dict[str, dict[str, str]]
@@ -386,10 +692,31 @@ class ADKAdapter(AgentAdapter):
                 expanded.extend(expand_compaction_item(item))
             else:
                 expanded.append(item)
+        attachment_counter = int(session.state.get(_INPUT_COUNTER_KEY, 0))
         for item in expanded:
+            if isinstance(item, MessageItem) and item.role == "user":
+                parts, attachment_counter = await _save_input_artifacts(
+                    self._user_message_parts(item),
+                    artifact_service=self.artifact_service,
+                    app_name=self.app_name,
+                    user_id=session.user_id,
+                    session_id=session.id,
+                    counter=attachment_counter,
+                )
+                if any(part.text or part.inline_data or part.file_data for part in parts):
+                    await self.session_service.append_event(
+                        session,
+                        Event(
+                            invocation_id=invocation_id,
+                            author="user",
+                            content=types.Content(role="user", parts=parts),
+                        ),
+                    )
+                continue
             event = self._history_event(item, call_map, invocation_id)
             if event is not None:
                 await self.session_service.append_event(session, event)
+        session.state[_INPUT_COUNTER_KEY] = attachment_counter
 
     def _history_event(
         self,
@@ -555,7 +882,9 @@ class ADKAdapter(AgentAdapter):
 
     def _thinking_config(self, run: AgentRun) -> types.ThinkingConfig | None:
         reasoning = run.request.reasoning
-        if reasoning is None or (reasoning.effort is None and reasoning.summary is None):
+        if reasoning is None or (
+            reasoning.effort is None and reasoning.summary is None
+        ):
             return None
         include_thoughts = reasoning.summary is not None or (
             reasoning.effort is not None and reasoning.effort != "none"
@@ -595,14 +924,27 @@ class _EventTranslator:
         self,
         client_tool_names: set[str],
         call_map: dict[str, dict[str, str]],
+        *,
+        artifact_service: BaseArtifactService,
+        artifact_registry: ArtifactRegistry,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        internal_tool_response_mapper: InternalToolResponseMapper | None,
     ) -> None:
         self.client_tool_names = client_tool_names
         self.call_map = call_map
+        self.artifact_service = artifact_service
+        self.artifact_registry = artifact_registry
+        self.app_name = app_name
+        self.user_id = user_id
+        self.session_id = session_id
+        self.internal_tool_response_mapper = internal_tool_response_mapper
         self._streamed_chars = 0
         self._streamed_thought_chars = 0
-        self._open_calls: dict[str, CustomItem] = {}
+        self._open_calls: dict[str, FunctionCallItem] = {}
 
-    def translate(self, event: Event) -> list[AdapterEvent]:
+    async def translate(self, event: Event) -> list[AdapterEvent]:
         if event.error_code or event.error_message:
             raise AdapterError(
                 event.error_message or f"ADK error: {event.error_code}",
@@ -647,10 +989,47 @@ class _EventTranslator:
             if fc.id in long_running_ids and fc.name in self.client_tool_names:
                 out.append(self._yield_client_call(fc, args))
             else:
-                out.append(self._open_internal_call(event, fc, args))
+                out.append(self._open_internal_call(fc, args))
 
         for fr in event.get_function_responses():
-            out.append(self._close_internal_call(event, fr))
+            call, output_item, arguments = self._close_internal_call(fr)
+            out.append(ItemDone(call))
+            mapped_items: list[Item] = []
+            if self.internal_tool_response_mapper is not None:
+                context = ADKToolResponse(
+                    name=fr.name or "",
+                    arguments=arguments,
+                    response=fr.response,
+                    output=(
+                        output_item.output
+                        if isinstance(output_item.output, str)
+                        else None
+                    ),
+                    author=event.author,
+                    call=call,
+                    output_item=output_item,
+                    create_artifact=lambda filename, data, mime_type: self._create_artifact(
+                        filename, data, mime_type, call.call_id
+                    ),
+                )
+                try:
+                    mapped = self.internal_tool_response_mapper(context)
+                    if isinstance(mapped, Awaitable):
+                        mapped = await mapped
+                    mapped_items = list(mapped)
+                except Exception as exc:
+                    raise AdapterError(
+                        f"Internal tool response mapper failed: {exc}",
+                        code="internal_tool_response_mapper_error",
+                    ) from exc
+            out.append(ItemDone(output_item))
+            out.extend(ItemDone(item) for item in mapped_items)
+
+        # The upload plugin also writes artifact_delta. Only deltas attached to
+        # tool responses represent generated output artifacts.
+        if event.get_function_responses() and event.actions.artifact_delta:
+            for filename, version in event.actions.artifact_delta.items():
+                out.append(await self._artifact_item(filename, version))
 
         usage = event.usage_metadata
         if usage is not None:
@@ -688,7 +1067,9 @@ class _EventTranslator:
             out.append(ReasoningDelta(delta=thought_text))
             if signature:
                 out.append(ReasoningDelta(encrypted_content=_b64(signature)))
-        elif signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0:
+        elif (
+            signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0
+        ):
             out.append(ReasoningDelta(encrypted_content=_b64(signature)))
         self._streamed_thought_chars = 0
         return out
@@ -707,34 +1088,100 @@ class _EventTranslator:
         )
 
     def _open_internal_call(
-        self, event: Event, fc: types.FunctionCall, args: str
+        self, fc: types.FunctionCall, args: str
     ) -> ItemAdded:
-        item = CustomItem.model_validate(
-            {
-                "type": EXTENSION_FUNCTION_CALL,
-                "id": new_function_call_id(),
-                "status": "in_progress",
-                "name": fc.name or "",
-                "arguments": args,
-                "agent": event.author,
-                "output": None,
-            }
+        call_id = new_call_id()
+        item = FunctionCallItem(
+            id=new_function_call_id(),
+            call_id=call_id,
+            status="in_progress",
+            name=fc.name or "",
+            arguments=args,
         )
         if fc.id:
             self._open_calls[fc.id] = item
+            self.call_map[call_id] = {"id": fc.id, "name": fc.name or ""}
         return ItemAdded(item)
 
     def _close_internal_call(
-        self, event: Event, fr: types.FunctionResponse
-    ) -> ItemDone:
+        self, fr: types.FunctionResponse
+    ) -> tuple[FunctionCallItem, FunctionCallOutputItem, dict[str, Any]]:
         opened = self._open_calls.pop(fr.id or "", None)
-        data = opened.model_dump() if opened is not None else {
-            "type": EXTENSION_FUNCTION_CALL,
-            "id": new_function_call_id(),
-            "name": fr.name or "",
-            "arguments": "{}",
-            "agent": event.author,
-        }
-        data["status"] = "completed"
-        data["output"] = json.dumps(fr.response) if fr.response is not None else None
-        return ItemDone(CustomItem.model_validate(data))
+        call = opened or FunctionCallItem(
+            id=new_function_call_id(),
+            call_id=new_call_id(),
+            name=fr.name or "",
+            arguments="{}",
+        )
+        call = call.model_copy(update={"status": "completed"})
+        self.call_map.setdefault(
+            call.call_id, {"id": fr.id or call.call_id, "name": fr.name or ""}
+        )
+        try:
+            arguments = json.loads(call.arguments)
+        except (TypeError, ValueError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        output_item = FunctionCallOutputItem(
+            id=f"fco_{uuid.uuid4().hex}",
+            call_id=call.call_id,
+            output=json.dumps(fr.response) if fr.response is not None else "null",
+            status="completed",
+        )
+        return call, output_item, arguments
+
+    async def _create_artifact(
+        self, filename: str, data: bytes, mime_type: str, call_id: str | None = None
+    ) -> Item:
+        version = await self.artifact_service.save_artifact(
+            app_name=self.app_name,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            filename=filename,
+            artifact=types.Part.from_bytes(data=data, mime_type=mime_type),
+        )
+        return (await self._artifact_item(filename, version, call_id)).item
+
+    async def _artifact_item(
+        self, filename: str, version: int, call_id: str | None = None
+    ) -> ItemDone:
+        part = await self.artifact_service.load_artifact(
+            app_name=self.app_name,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            filename=filename,
+            version=version,
+        )
+        blob = part.inline_data if part is not None else None
+        if blob is None or blob.data is None:
+            raise AdapterError(
+                f"Generated artifact '{filename}' could not be loaded.",
+                code="artifact_not_found",
+            )
+        mime_type = blob.mime_type if blob and blob.mime_type else _guess_mime(filename)
+        artifact_id = self.artifact_registry.register(
+            ArtifactRecord(
+                service=self.artifact_service,
+                app_name=self.app_name,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                filename=filename,
+                version=version,
+                mime_type=mime_type,
+            )
+        )
+        return ItemDone(
+            CustomItem.model_validate(
+                {
+                    "type": ARTIFACT_TYPE,
+                    "id": artifact_id,
+                    "status": "completed",
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": len(blob.data),
+                    "content_url": f"/v1/artifacts/{artifact_id}/content",
+                    **({"call_id": call_id} if call_id else {}),
+                }
+            )
+        )
