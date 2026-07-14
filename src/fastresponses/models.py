@@ -5,8 +5,7 @@ request bodies, items, content parts, the response object, and the
 semantic streaming events.
 
 The models are intentionally permissive (``extra="allow"``) so that
-provider-specific extensions (e.g. ``adk:function_call`` items) round-trip
-without loss.
+provider-specific extensions round-trip without loss.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import time
 import uuid
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 def _id(prefix: str) -> str:
@@ -75,6 +74,7 @@ class InputFile(BaseModel):
     filename: str | None = None
     file_data: str | None = None
     file_url: str | None = None
+    _download_mime_type: str | None = PrivateAttr(default=None)
 
 
 class OutputText(BaseModel):
@@ -188,7 +188,7 @@ class ItemReference(BaseModel):
 
 
 class CustomItem(BaseModel):
-    """Fallback for provider-specific extension items (e.g. ``adk:function_call``)."""
+    """Fallback for provider-specific extension items."""
 
     model_config = ConfigDict(extra="allow")
 
