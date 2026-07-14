@@ -31,8 +31,24 @@ with zero custom integration.
   agent can call them. Control yields back to your client as a standard
   `function_call` output item; answer with a `function_call_output` item to resume.
 - **Agent-internal tools** (functions owned by the ADK agent) run server-side and
-  are surfaced as `adk:function_call` extension items — a receipt of what happened,
-  per the spec's guidance for internally-hosted tools.
+  are surfaced as provider-neutral, canonical `function_call` /
+  `function_call_output` pairs. Pass an `internal_tool_response_mapper` to
+  `ADKAdapter` to derive additional namespaced items from a completed tool without
+  modifying its canonical output. Mappers may be synchronous or asynchronous and
+  receive a `create_artifact` callback. FastResponses implements the
+  [`ajac-zero:artifact`](https://github.com/ajac-zero/openresponses-extensions#artifact)
+  extension contract for these generic downloads and backs each item with its
+  authenticated artifact endpoint. Mapper errors fail the response as server
+  configuration errors.
+- **Brokered input attachments**: standard `input_file.file_url` capabilities are
+  fetched only from an explicit origin allowlist, bounded by timeout, redirect, and
+  byte-limit checks, then stored in the ADK artifact service. Up to three redirects
+  are followed; every target must independently satisfy the HTTPS/loopback and origin
+  policy. The response `Content-Type` is authoritative when specific, with filename
+  inference and `application/octet-stream` as fallbacks. Standard-optional filenames
+  are accepted and synthesized internally when absent. Model context uses deterministic
+  transcript-order references (`attachment_1`, `attachment_2`, ...), while stateless
+  replay reconstructs those references from the standard transcript.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
@@ -42,9 +58,9 @@ with zero custom integration.
   (`auto` / `required` / `none` / forced function / `allowed_tools`) mapped to
   ADK. `allowed_tools` is enforced server-side as a hard constraint: calls to
   tools outside the allowed set are suppressed before execution.
-- **Multimodal input**: `input_image` and `input_file` parts (data URLs,
-  base64 file data, or remote URLs) are translated to genai `inline_data` /
-  `file_data` parts — in fresh input and in replayed history.
+- **Multimodal input**: `input_image` and `input_file` parts are translated to
+  genai parts in fresh input and replayed history. ADK `input_file.file_url` fetching
+  is provider-controlled and disabled unless its origin is explicitly allowed.
 - **Structured output**: `text.format` `json_schema` / `json_object` map to
   the model's native JSON-schema-constrained decoding.
 - **`reasoning.effort` / `reasoning.summary`** map to a genai `ThinkingConfig`
