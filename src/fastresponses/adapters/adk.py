@@ -8,8 +8,7 @@ Open Responses provider:
   ``reasoning`` output items with streamed summary text; thought signatures
   are attached as ``encrypted_content`` when available.
 - Tools owned by the ADK agent run *inside* the provider; each execution is
-  surfaced as an ``adk:function_call`` extension item (a "receipt" per the
-  Open Responses spec for internally-hosted tools).
+  surfaced as a standard ``function_call`` / ``function_call_output`` pair.
 - Function tools declared by the *client* in ``request.tools`` are exposed to
   the agent as long-running ADK tools: when the model calls one, the run
   yields control back and the server emits a standard ``function_call``
@@ -53,7 +52,6 @@ from ..adapter import (  # noqa: I001
 from ..compaction import expand_compaction_item
 from ..models import (
     CompactionItem,
-    CustomItem,
     FunctionCallItem,
     FunctionCallOutputItem,
     FunctionTool,
@@ -69,9 +67,6 @@ from ..models import (
     new_call_id,
     new_function_call_id,
 )
-
-EXTENSION_FUNCTION_CALL = "adk:function_call"
-
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
@@ -600,7 +595,7 @@ class _EventTranslator:
         self.call_map = call_map
         self._streamed_chars = 0
         self._streamed_thought_chars = 0
-        self._open_calls: dict[str, CustomItem] = {}
+        self._open_calls: dict[str, FunctionCallItem] = {}
 
     def translate(self, event: Event) -> list[AdapterEvent]:
         if event.error_code or event.error_message:
@@ -647,10 +642,12 @@ class _EventTranslator:
             if fc.id in long_running_ids and fc.name in self.client_tool_names:
                 out.append(self._yield_client_call(fc, args))
             else:
-                out.append(self._open_internal_call(event, fc, args))
+                out.append(self._open_internal_call(fc, args))
 
         for fr in event.get_function_responses():
-            out.append(self._close_internal_call(event, fr))
+            call, output_item = self._close_internal_call(fr)
+            out.append(ItemDone(call))
+            out.append(ItemDone(output_item))
 
         usage = event.usage_metadata
         if usage is not None:
@@ -706,35 +703,38 @@ class _EventTranslator:
             )
         )
 
-    def _open_internal_call(
-        self, event: Event, fc: types.FunctionCall, args: str
-    ) -> ItemAdded:
-        item = CustomItem.model_validate(
-            {
-                "type": EXTENSION_FUNCTION_CALL,
-                "id": new_function_call_id(),
-                "status": "in_progress",
-                "name": fc.name or "",
-                "arguments": args,
-                "agent": event.author,
-                "output": None,
-            }
+    def _open_internal_call(self, fc: types.FunctionCall, args: str) -> ItemAdded:
+        call_id = new_call_id()
+        item = FunctionCallItem(
+            id=new_function_call_id(),
+            call_id=call_id,
+            status="in_progress",
+            name=fc.name or "",
+            arguments=args,
         )
         if fc.id:
             self._open_calls[fc.id] = item
+            self.call_map[call_id] = {"id": fc.id, "name": fc.name or ""}
         return ItemAdded(item)
 
     def _close_internal_call(
-        self, event: Event, fr: types.FunctionResponse
-    ) -> ItemDone:
+        self, fr: types.FunctionResponse
+    ) -> tuple[FunctionCallItem, FunctionCallOutputItem]:
         opened = self._open_calls.pop(fr.id or "", None)
-        data = opened.model_dump() if opened is not None else {
-            "type": EXTENSION_FUNCTION_CALL,
-            "id": new_function_call_id(),
-            "name": fr.name or "",
-            "arguments": "{}",
-            "agent": event.author,
-        }
-        data["status"] = "completed"
-        data["output"] = json.dumps(fr.response) if fr.response is not None else None
-        return ItemDone(CustomItem.model_validate(data))
+        call = opened or FunctionCallItem(
+            id=new_function_call_id(),
+            call_id=new_call_id(),
+            name=fr.name or "",
+            arguments="{}",
+        )
+        call = call.model_copy(update={"status": "completed"})
+        self.call_map.setdefault(
+            call.call_id, {"id": fr.id or call.call_id, "name": fr.name or ""}
+        )
+        output_item = FunctionCallOutputItem(
+            id=f"fco_{uuid.uuid4().hex}",
+            call_id=call.call_id,
+            output=json.dumps(fr.response) if fr.response is not None else "null",
+            status="completed",
+        )
+        return call, output_item

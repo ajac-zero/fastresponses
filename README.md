@@ -31,8 +31,9 @@ with zero custom integration.
   agent can call them. Control yields back to your client as a standard
   `function_call` output item; answer with a `function_call_output` item to resume.
 - **Agent-internal tools** (functions owned by the ADK agent) run server-side and
-  are surfaced as `adk:function_call` extension items — a receipt of what happened,
-  per the spec's guidance for internally-hosted tools.
+  are surfaced as provider-neutral, canonical `function_call` /
+  `function_call_output` pairs. This replaces the earlier `adk:function_call`
+  extension wire format.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached

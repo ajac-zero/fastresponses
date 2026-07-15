@@ -125,7 +125,7 @@ def test_streaming_deltas_are_not_duplicated_by_final_event():
     assert final["output"][0]["content"][0]["text"] == "Hello world"
 
 
-def test_internal_tool_call_surfaces_extension_item():
+def test_internal_tool_call_surfaces_standard_pair():
     client, _ = make_adk_client(
         [
             call_turn("get_weather", {"city": "Tokyo"}),
@@ -137,14 +137,20 @@ def test_internal_tool_call_surfaces_extension_item():
     body = r.json()
     assert body["status"] == "completed"
 
-    receipt = body["output"][0]
-    assert receipt["type"] == "adk:function_call"
-    assert receipt["status"] == "completed"
-    assert receipt["name"] == "get_weather"
-    assert '"city": "Tokyo"' in receipt["arguments"]
-    assert "sunny" in receipt["output"]
+    call, output = body["output"][:2]
+    assert call["type"] == "function_call"
+    assert output["type"] == "function_call_output"
+    assert call["status"] == output["status"] == "completed"
+    assert call["call_id"] == output["call_id"]
+    assert call["name"] == "get_weather"
+    assert '"city": "Tokyo"' in call["arguments"]
+    assert "sunny" in output["output"]
+    for item in (call, output):
+        assert "provider" not in item
+        assert "provider_call_id" not in item
+        assert "agent" not in item
 
-    message = body["output"][1]
+    message = body["output"][2]
     assert message["type"] == "message"
     assert message["content"][0]["text"] == "It is sunny in Tokyo."
     # usage summed across both LLM calls
@@ -349,6 +355,39 @@ def test_stateless_history_replay():
         if part.text
     ]
     assert texts == ["capital of France?", "Paris.", "population?"]
+
+
+def test_stateless_history_replays_completed_internal_tool_pair():
+    client, llm = make_adk_client([text_turn("It was sunny.")])
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {"type": "message", "role": "user", "content": "weather?"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": '{"city":"Tokyo"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": '{"forecast":"sunny"}',
+                },
+                {"type": "message", "role": "assistant", "content": "Sunny."},
+                {"type": "message", "role": "user", "content": "and yesterday?"},
+            ]
+        },
+    ).json()
+
+    assert body["status"] == "completed"
+    parts = [part for content in llm.requests[0].contents for part in content.parts or []]
+    call = next(part.function_call for part in parts if part.function_call)
+    output = next(part.function_response for part in parts if part.function_response)
+    assert call.name == output.name == "get_weather"
+    assert call.args == {"city": "Tokyo"}
+    assert output.response == {"forecast": "sunny"}
 
 
 def test_compaction_round_trip():
@@ -650,8 +689,9 @@ def test_max_tool_calls_marks_response_incomplete():
     assert body["incomplete_details"] == {"reason": "max_tool_calls"}
     # first call went through, second was cut off
     assert calls["n"] >= 1
-    receipts = [i for i in body["output"] if i["type"] == "adk:function_call"]
-    assert len(receipts) == 1
+    tool_calls = [i for i in body["output"] if i["type"] == "function_call"]
+    outputs = [i for i in body["output"] if i["type"] == "function_call_output"]
+    assert len(tool_calls) == len(outputs) == 1
 
 
 def test_allowed_tools_blocks_disallowed_internal_tool():
