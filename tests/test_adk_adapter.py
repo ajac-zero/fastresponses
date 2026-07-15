@@ -18,9 +18,12 @@ from google.genai import types
 
 from fastresponses.adapters.adk import (
     ADKAdapter,
+    ADKToolResponse,
     InputFileContent,
     InputFileReferenceContext,
 )
+from fastresponses.artifacts import ArtifactRecord, ArtifactRegistry
+from fastresponses.models import CustomItem
 from fastresponses.server import create_app
 
 from conftest import read_sse
@@ -165,6 +168,74 @@ def test_internal_tool_call_surfaces_standard_pair():
     assert message["content"][0]["text"] == "It is sunny in Tokyo."
     # usage summed across both LLM calls
     assert body["usage"]["total_tokens"] == 30
+
+
+def test_internal_tool_response_mapper_receives_context_and_preserves_order():
+    seen: list[ADKToolResponse] = []
+
+    def mapper(response: ADKToolResponse):
+        seen.append(response)
+        return [
+            CustomItem.model_validate(
+                {
+                    "type": "test:presentation",
+                    "id": "presentation_1",
+                    "status": "completed",
+                    "call_id": response.call.call_id,
+                }
+            )
+        ]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+    )
+    body = TestClient(create_app(adapter)).post(
+        "/v1/responses", json={"input": "weather?"}
+    ).json()
+
+    assert [item["type"] for item in body["output"]] == [
+        "function_call",
+        "function_call_output",
+        "test:presentation",
+        "message",
+    ]
+    assert seen[0].arguments == {"city": "Tokyo"}
+    assert seen[0].response == {"city": "Tokyo", "forecast": "sunny"}
+
+
+def test_mapper_error_completes_canonical_pair_before_response_fails():
+    def mapper(_: ADKToolResponse):
+        raise RuntimeError("bad mapper configuration")
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+    )
+    client = TestClient(create_app(adapter))
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "weather?", "stream": True}
+    ) as response:
+        payloads = [event for event in read_sse(response) if isinstance(event, dict)]
+
+    done_types = [
+        event["item"]["type"]
+        for event in payloads
+        if event["type"] == "response.output_item.done"
+    ]
+    assert done_types == ["function_call", "function_call_output"]
+    assert payloads[-1]["type"] == "response.failed"
+    assert payloads[-1]["response"]["error"]["code"] == "internal_tool_response_mapper_error"
 
 
 def test_client_tool_yields_control_and_resumes():
@@ -1017,7 +1088,6 @@ def test_default_reference_store_is_available_to_agent_tools():
             ]
         },
     ).json()
-
     assert body["status"] == "completed"
     assert '"data": "hello"' in body["output"][1]["output"]
 

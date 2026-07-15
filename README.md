@@ -73,6 +73,9 @@ with zero custom integration.
   Sequential `attachment_N` allocation is coordinated within one adapter process;
   deployments sharing ADK sessions across workers should provide external
   serialization or a custom store/reference scheme with collision-resistant IDs.
+- Pass an `internal_tool_response_mapper` to `ADKAdapter` to derive additional
+  namespaced items from completed internal tools. Mappers may create downloadable
+  `ajac-zero:artifact` items backed by the authenticated artifact endpoint.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
@@ -406,6 +409,10 @@ pass for both adapters, covering both HTTP and WebSocket transports.
 
 - Background event buffers (for `GET /v1/responses/{id}/events` resumption)
   are in-process and bounded to the 64 most recent background runs.
+- Generated artifact download IDs are process-local, retained for one hour, and
+  bounded to the 1,024 most recently used records. Restarts and requests routed
+  to another worker invalidate those URLs; multi-worker deployments need sticky
+  routing or a shared registry implementation.
 - `include: ["message.output_text.logprobs"]` is accepted but logprob arrays
   stay empty (ADK does not surface per-token logprobs in its event stream; the
   request maps to `response_logprobs` on the model call).
