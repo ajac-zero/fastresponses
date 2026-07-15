@@ -5,8 +5,7 @@ request bodies, items, content parts, the response object, and the
 semantic streaming events.
 
 The models are intentionally permissive (``extra="allow"``) so that
-provider-specific extensions (e.g. ``adk:function_call`` items) round-trip
-without loss.
+provider-specific extensions round-trip without loss.
 """
 
 from __future__ import annotations
@@ -188,7 +187,7 @@ class ItemReference(BaseModel):
 
 
 class CustomItem(BaseModel):
-    """Fallback for provider-specific extension items (e.g. ``adk:function_call``)."""
+    """Fallback for provider-specific extension items."""
 
     model_config = ConfigDict(extra="allow")
 
