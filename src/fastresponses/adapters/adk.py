@@ -54,9 +54,11 @@ from ..adapter import (  # noqa: I001
     TextDelta,
     UsageDelta,
 )
+from ..artifacts import ArtifactRecord, ArtifactRegistry
 from ..compaction import expand_compaction_item
 from ..models import (
     CompactionItem,
+    CustomItem,
     FunctionCallItem,
     FunctionCallOutputItem,
     FunctionTool,
@@ -73,6 +75,27 @@ from ..models import (
     new_function_call_id,
 )
 
+ARTIFACT_TYPE = "ajac-zero:artifact"
+
+
+@dataclass(frozen=True)
+class ADKToolResponse:
+    """Stable context for deriving items from a completed internal ADK tool."""
+
+    name: str
+    arguments: dict[str, Any]
+    response: Any
+    output: str | None
+    author: str
+    call: FunctionCallItem
+    output_item: FunctionCallOutputItem
+    create_artifact: Callable[[str, bytes, str], Awaitable[Item]]
+
+
+InternalToolResponseMapper = Callable[
+    [ADKToolResponse], Iterable[Item] | Awaitable[Iterable[Item]]
+]
+
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -85,6 +108,7 @@ _MAX_REPLAY_INPUT_FILES_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_INPUT_FILE_REDIRECTS = 3
 _GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
 _INPUT_COUNTER_KEY = "fastresponses:input_attachment_counter"
+_INPUT_ARTIFACT_PREFIX = "attachment_"
 
 InputFileAction = Literal["inline", "url", "reference", "reject"]
 InputFileRouter = Callable[[InputFile], InputFileAction | Awaitable[InputFileAction]]
@@ -166,6 +190,41 @@ class ADKArtifactInputFileStore:
         return "[Uploaded Artifact: " + json.dumps(
             reference, separators=(",", ":"), sort_keys=True
         ) + "]"
+
+
+class _GeneratedArtifactService(BaseArtifactService):
+    """Prevent agent tools from mutating adapter-owned input artifacts."""
+
+    def __init__(self, service: BaseArtifactService) -> None:
+        self.service = service
+
+    async def save_artifact(self, **kwargs):
+        _validate_generated_artifact_name(kwargs["filename"])
+        return await self.service.save_artifact(**kwargs)
+
+    async def load_artifact(self, **kwargs):
+        return await self.service.load_artifact(**kwargs)
+
+    async def list_artifact_keys(self, **kwargs):
+        return await self.service.list_artifact_keys(**kwargs)
+
+    async def delete_artifact(self, **kwargs):
+        _validate_generated_artifact_name(kwargs["filename"])
+        return await self.service.delete_artifact(**kwargs)
+
+    async def list_versions(self, **kwargs):
+        return await self.service.list_versions(**kwargs)
+
+    async def list_artifact_versions(self, **kwargs):
+        return await self.service.list_artifact_versions(**kwargs)
+
+    async def get_artifact_version(self, **kwargs):
+        return await self.service.get_artifact_version(**kwargs)
+
+
+def _validate_generated_artifact_name(filename: str) -> None:
+    if filename.startswith(_INPUT_ARTIFACT_PREFIX):
+        raise ValueError("Generated artifact filename uses a reserved input namespace.")
 
 
 def _validate_input_file_url(url: str, allowed_origins: frozenset[str]) -> httpx.URL:
@@ -418,6 +477,7 @@ class ADKAdapter(AgentAdapter):
         default_input_file_action: InputFileAction = "reject",
         input_file_router: InputFileRouter | None = None,
         input_file_reference_store: InputFileReferenceStore | None = None,
+        internal_tool_response_mapper: InternalToolResponseMapper | None = None,
     ) -> None:
         if input_file_routes is not None and input_file_router is not None:
             raise ValueError("Configure input_file_routes or input_file_router, not both.")
@@ -427,6 +487,8 @@ class ADKAdapter(AgentAdapter):
         self.session_service = session_service or InMemorySessionService()
         self.artifact_service = artifact_service or InMemoryArtifactService()
         self.default_model = model_name or self._infer_model_name(agent)
+        self.artifact_registry = ArtifactRegistry()
+        self.internal_tool_response_mapper = internal_tool_response_mapper
         origins: set[str] = set()
         for origin in input_file_url_origins:
             parsed = httpx.URL(origin)
@@ -612,11 +674,20 @@ class ADKAdapter(AgentAdapter):
             agent=agent,
             app_name=self.app_name,
             session_service=self.session_service,
-            artifact_service=self.artifact_service,
+            artifact_service=_GeneratedArtifactService(self.artifact_service),
         )
 
         client_tool_names = {t.name for t in client_tools}
-        translator = _EventTranslator(client_tool_names, call_map)
+        translator = _EventTranslator(
+            client_tool_names,
+            call_map,
+            artifact_service=self.artifact_service,
+            artifact_registry=self.artifact_registry,
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=session.id,
+            internal_tool_response_mapper=self.internal_tool_response_mapper,
+        )
         max_tool_calls = run.request.max_tool_calls
         tool_calls = 0
 
@@ -633,8 +704,9 @@ class ADKAdapter(AgentAdapter):
                         yield Incomplete("max_tool_calls")
                         break
                     tool_calls += pending
-                for adapter_event in translator.translate(event):
+                for adapter_event in await translator.translate(event):
                     yield adapter_event
+                translator.raise_deferred_error()
         except AdapterError:
             raise
         except ValueError as exc:
@@ -765,7 +837,7 @@ class ADKAdapter(AgentAdapter):
                             app_name=self.app_name,
                             user_id=user_id,
                             session_id=session_id,
-                            reference_id=f"attachment_{attachment_counter}",
+                            reference_id=f"{_INPUT_ARTIFACT_PREFIX}{attachment_counter}",
                         ),
                     )
                 )
@@ -1182,14 +1254,28 @@ class _EventTranslator:
         self,
         client_tool_names: set[str],
         call_map: dict[str, dict[str, str]],
+        *,
+        artifact_service: BaseArtifactService,
+        artifact_registry: ArtifactRegistry,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        internal_tool_response_mapper: InternalToolResponseMapper | None,
     ) -> None:
         self.client_tool_names = client_tool_names
         self.call_map = call_map
+        self.artifact_service = artifact_service
+        self.artifact_registry = artifact_registry
+        self.app_name = app_name
+        self.user_id = user_id
+        self.session_id = session_id
+        self.internal_tool_response_mapper = internal_tool_response_mapper
+        self._deferred_error: AdapterError | None = None
         self._streamed_chars = 0
         self._streamed_thought_chars = 0
         self._open_calls: dict[str, FunctionCallItem] = {}
 
-    def translate(self, event: Event) -> list[AdapterEvent]:
+    async def translate(self, event: Event) -> list[AdapterEvent]:
         if event.error_code or event.error_message:
             raise AdapterError(
                 event.error_message or f"ADK error: {event.error_code}",
@@ -1240,6 +1326,38 @@ class _EventTranslator:
             call, output_item = self._close_internal_call(fr)
             out.append(ItemDone(call))
             out.append(ItemDone(output_item))
+            if self.internal_tool_response_mapper is not None:
+                try:
+                    arguments = json.loads(call.arguments)
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    context = ADKToolResponse(
+                        name=fr.name or "",
+                        arguments=arguments,
+                        response=fr.response,
+                        output=output_item.output if isinstance(output_item.output, str) else None,
+                        author=event.author,
+                        call=call,
+                        output_item=output_item,
+                        create_artifact=lambda filename, data, mime_type: self._create_artifact(
+                            filename, data, mime_type, call.call_id
+                        ),
+                    )
+                    mapped = self.internal_tool_response_mapper(context)
+                    if isinstance(mapped, Awaitable):
+                        mapped = await mapped
+                    out.extend(ItemDone(item) for item in mapped)
+                except Exception as exc:
+                    self._deferred_error = AdapterError(
+                        "Internal tool response mapper failed.",
+                        code="internal_tool_response_mapper_error",
+                    )
+                    self._deferred_error.__cause__ = exc
+
+        if event.actions.artifact_delta:
+            for filename, version in event.actions.artifact_delta.items():
+                if not filename.startswith(_INPUT_ARTIFACT_PREFIX):
+                    out.append(await self._artifact_item(filename, version))
 
         usage = event.usage_metadata
         if usage is not None:
@@ -1257,6 +1375,11 @@ class _EventTranslator:
         if event.finish_reason == types.FinishReason.MAX_TOKENS:
             out.append(Incomplete("max_output_tokens"))
         return out
+
+    def raise_deferred_error(self) -> None:
+        if self._deferred_error is not None:
+            error, self._deferred_error = self._deferred_error, None
+            raise error
 
     def _final_reasoning(self, parts: list[types.Part]) -> list[AdapterEvent]:
         """Reasoning ("thought") handling for a final aggregated event.
@@ -1332,3 +1455,59 @@ class _EventTranslator:
             status="completed",
         )
         return call, output_item
+
+    async def _create_artifact(
+        self, filename: str, data: bytes, mime_type: str, call_id: str | None = None
+    ) -> Item:
+        _validate_generated_artifact_name(filename)
+        version = await self.artifact_service.save_artifact(
+            app_name=self.app_name,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            filename=filename,
+            artifact=types.Part.from_bytes(data=data, mime_type=mime_type),
+        )
+        return (await self._artifact_item(filename, version, call_id)).item
+
+    async def _artifact_item(
+        self, filename: str, version: int, call_id: str | None = None
+    ) -> ItemDone:
+        part = await self.artifact_service.load_artifact(
+            app_name=self.app_name,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            filename=filename,
+            version=version,
+        )
+        blob = part.inline_data if part is not None else None
+        if blob is None or blob.data is None:
+            raise AdapterError(
+                f"Generated artifact '{filename}' could not be loaded.",
+                code="artifact_not_found",
+            )
+        mime_type = blob.mime_type or _guess_mime(filename)
+        artifact_id = self.artifact_registry.register(
+            ArtifactRecord(
+                service=self.artifact_service,
+                app_name=self.app_name,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                filename=filename,
+                version=version,
+                mime_type=mime_type,
+            )
+        )
+        return ItemDone(
+            CustomItem.model_validate(
+                {
+                    "type": ARTIFACT_TYPE,
+                    "id": artifact_id,
+                    "status": "completed",
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": len(blob.data),
+                    "content_url": f"/v1/artifacts/{artifact_id}/content",
+                    **({"call_id": call_id} if call_id else {}),
+                }
+            )
+        )
