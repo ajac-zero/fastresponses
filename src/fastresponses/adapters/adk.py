@@ -25,9 +25,10 @@ import base64
 import json
 import mimetypes
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
+import httpx
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.events import Event
@@ -70,6 +71,123 @@ from ..models import (
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+_MAX_INPUT_FILE_BYTES = 32 * 1024 * 1024
+_MAX_INPUT_FILE_REDIRECTS = 3
+_GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
+
+
+def _validate_input_file_url(url: str, allowed_origins: frozenset[str]) -> httpx.URL:
+    parsed = httpx.URL(url)
+    if parsed.userinfo:
+        raise AdapterError(
+            "Input file URLs must not contain credentials.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.host in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise AdapterError(
+            "Input file URLs must use HTTPS.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    origin = str(parsed.copy_with(path="", query=None, fragment=None)).rstrip("/")
+    if origin not in allowed_origins:
+        raise AdapterError(
+            "Input file URL origin is not allowed.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    return parsed
+
+
+def _response_mime_type(response: httpx.Response, filename: str | None) -> str:
+    content_type = response.headers.get("content-type", "")
+    mime_type = content_type.partition(";")[0].strip().lower()
+    if mime_type not in _GENERIC_MIME_TYPES and "/" in mime_type:
+        return mime_type
+    return _guess_mime(filename)
+
+
+async def _fetch_input_file(
+    url: str, filename: str | None, allowed_origins: frozenset[str]
+) -> tuple[bytes, str]:
+    current = _validate_input_file_url(url, allowed_origins)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            for redirects in range(_MAX_INPUT_FILE_REDIRECTS + 1):
+                async with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise AdapterError(
+                                "Input file redirect is missing Location.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        if redirects == _MAX_INPUT_FILE_REDIRECTS:
+                            raise AdapterError(
+                                "Input file exceeded the redirect limit.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        current = _validate_input_file_url(
+                            str(current.join(location)), allowed_origins
+                        )
+                        continue
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise AdapterError(
+                            f"Input file download returned HTTP {response.status_code}.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    declared = response.headers.get("content-length")
+                    if declared is not None and int(declared) > _MAX_INPUT_FILE_BYTES:
+                        raise AdapterError(
+                            "Input file exceeds the maximum size.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > _MAX_INPUT_FILE_BYTES:
+                            raise AdapterError(
+                                "Input file exceeds the maximum size.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        chunks.append(chunk)
+                    if declared is not None and size != int(declared):
+                        raise AdapterError(
+                            "Input file response was truncated.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    return b"".join(chunks), _response_mime_type(response, filename)
+        raise AssertionError("unreachable")
+    except AdapterError:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AdapterError(
+            f"Input file download failed: {exc}",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        ) from exc
 
 
 def _decode_data_url(url: str) -> types.Blob | None:
@@ -134,7 +252,9 @@ def _content_part_to_adk(part: Any) -> types.Part | None:
                 return None
             return types.Part(
                 inline_data=types.Blob(
-                    mime_type=_guess_mime(part.filename), data=data
+                    mime_type=part._download_mime_type or _guess_mime(part.filename),
+                    data=data,
+                    display_name=part.filename,
                 )
             )
         if part.file_url:
@@ -174,7 +294,9 @@ class ClientFunctionTool(BaseTool):
             parameters_json_schema=self._parameters,
         )
 
-    async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    async def run_async(
+        self, *, args: dict[str, Any], tool_context: ToolContext
+    ) -> Any:
         # Returning a falsy value from a long-running tool makes ADK skip the
         # function response and end the invocation: control yields back to us.
         return None
@@ -192,11 +314,15 @@ class ADKAdapter(AgentAdapter):
         app_name: str = "fastresponses",
         session_service: BaseSessionService | None = None,
         model_name: str | None = None,
+        input_file_url_origins: Iterable[str] = (),
     ) -> None:
         self.agent = agent
         self.app_name = app_name
         self.session_service = session_service or InMemorySessionService()
         self.default_model = model_name or self._infer_model_name(agent)
+        self.input_file_url_origins = frozenset(
+            str(httpx.URL(origin)).rstrip("/") for origin in input_file_url_origins
+        )
 
     @staticmethod
     def _infer_model_name(agent: BaseAgent) -> str:
@@ -214,7 +340,8 @@ class ADKAdapter(AgentAdapter):
         call_map: dict[str, dict[str, str]] = dict(state.get("call_ids") or {})
         user_id: str = state.get("user_id") or run.request.user or "default"
 
-        history, new_message = self._split_input(run.new_items, call_map)
+        hydrated_new = await self._hydrate_input_files(run.new_items)
+        history, new_message = self._split_input(hydrated_new, call_map)
 
         session = await self._resolve_session(state, user_id)
         if session is None:
@@ -224,7 +351,9 @@ class ADKAdapter(AgentAdapter):
                 user_id=user_id,
                 session_id=f"or-{uuid.uuid4().hex}",
             )
-            replay = run.context_items[: len(run.context_items) - len(run.new_items)]
+            replay = await self._hydrate_input_files(
+                run.context_items[: len(run.context_items) - len(run.new_items)]
+            )
             history = [*replay, *history]
 
         await self._seed_history(session, history, call_map)
@@ -273,6 +402,36 @@ class ADKAdapter(AgentAdapter):
     # ------------------------------------------------------------------
     # Input translation
     # ------------------------------------------------------------------
+
+    async def _hydrate_input_files(self, items: list[Item]) -> list[Item]:
+        hydrated: list[Item] = []
+        for item in items:
+            if not isinstance(item, MessageItem) or not isinstance(item.content, list):
+                hydrated.append(item)
+                continue
+            content: list[Any] = []
+            for part in item.content:
+                if not isinstance(part, InputFile) or not part.file_url:
+                    content.append(part)
+                    continue
+                data, mime_type = await _fetch_input_file(
+                    part.file_url, part.filename, self.input_file_url_origins
+                )
+                filename = part.filename
+                if not filename:
+                    extension = mimetypes.guess_extension(mime_type) or ".bin"
+                    filename = f"attachment{extension}"
+                downloaded = part.model_copy(
+                    update={
+                        "filename": filename,
+                        "file_url": None,
+                        "file_data": _b64(data),
+                    }
+                )
+                downloaded._download_mime_type = mime_type
+                content.append(downloaded)
+            hydrated.append(item.model_copy(update={"content": content}))
+        return hydrated
 
     def _split_input(
         self, items: list[Item], call_map: dict[str, dict[str, str]]
@@ -550,7 +709,9 @@ class ADKAdapter(AgentAdapter):
 
     def _thinking_config(self, run: AgentRun) -> types.ThinkingConfig | None:
         reasoning = run.request.reasoning
-        if reasoning is None or (reasoning.effort is None and reasoning.summary is None):
+        if reasoning is None or (
+            reasoning.effort is None and reasoning.summary is None
+        ):
             return None
         include_thoughts = reasoning.summary is not None or (
             reasoning.effort is not None and reasoning.effort != "none"
@@ -685,7 +846,9 @@ class _EventTranslator:
             out.append(ReasoningDelta(delta=thought_text))
             if signature:
                 out.append(ReasoningDelta(encrypted_content=_b64(signature)))
-        elif signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0:
+        elif (
+            signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0
+        ):
             out.append(ReasoningDelta(encrypted_content=_b64(signature)))
         self._streamed_thought_chars = 0
         return out

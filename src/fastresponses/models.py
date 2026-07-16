@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 def _id(prefix: str) -> str:
@@ -74,6 +74,7 @@ class InputFile(BaseModel):
     filename: str | None = None
     file_data: str | None = None
     file_url: str | None = None
+    _download_mime_type: str | None = PrivateAttr(default=None)
 
 
 class OutputText(BaseModel):
