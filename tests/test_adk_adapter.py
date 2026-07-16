@@ -211,7 +211,7 @@ def test_internal_tool_response_mapper_receives_context_and_preserves_order():
 
 def test_mapper_error_completes_canonical_pair_before_response_fails():
     def mapper(_: ADKToolResponse):
-        raise RuntimeError("bad mapper configuration")
+        raise RuntimeError("secret mapper configuration")
 
     llm = ScriptedLlm(
         turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
@@ -236,6 +236,10 @@ def test_mapper_error_completes_canonical_pair_before_response_fails():
     assert done_types == ["function_call", "function_call_output"]
     assert payloads[-1]["type"] == "response.failed"
     assert payloads[-1]["response"]["error"]["code"] == "internal_tool_response_mapper_error"
+    assert payloads[-1]["response"]["error"]["message"] == (
+        "Internal tool response mapper failed."
+    )
+    assert "secret" not in str(payloads[-1])
 
 
 def test_client_tool_yields_control_and_resumes():
@@ -895,6 +899,118 @@ def test_input_file_url_accepts_allowlisted_ipv6_loopback():
     assert blob.display_name == "notes.txt"
 
 
+async def save_report(tool_context: ToolContext) -> dict:
+    """Save a generated report."""
+    version = await tool_context.save_artifact(
+        "report.txt",
+        types.Part.from_bytes(data=b"generated report", mime_type="text/plain"),
+    )
+    return {"version": version}
+
+
+def test_generated_artifact_non_streaming_and_download():
+    client, _ = make_adk_client(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = next(
+        item for item in body["output"] if item["type"] == "ajac-zero:artifact"
+    )
+    assert artifact["filename"] == "report.txt"
+    assert artifact["mime_type"] == "text/plain"
+    assert artifact["size"] == len(b"generated report")
+    download = client.get(artifact["content_url"])
+    assert download.content == b"generated report"
+    assert download.headers["x-content-type-options"] == "nosniff"
+
+
+def test_inline_input_file_is_not_emitted_as_output_artifact():
+    llm = ScriptedLlm(turns=[text_turn("Read it.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        input_file_routes={"inline": ".txt"},
+    )
+    body = TestClient(create_app(adapter)).post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "input.txt",
+                            "file_data": "aGVsbG8=",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+    assert all(item["type"] != "ajac-zero:artifact" for item in body["output"])
+
+
+def test_generated_artifact_cannot_overwrite_referenced_input_or_break_replay():
+    async def try_overwrite(tool_context: ToolContext) -> dict:
+        """Try to overwrite the referenced input."""
+        try:
+            await tool_context.save_artifact(
+                "attachment_1",
+                types.Part.from_bytes(data=b"generated", mime_type="text/plain"),
+            )
+        except ValueError as exc:
+            blocked = "reserved input namespace" in str(exc)
+        else:
+            blocked = False
+        artifact = await tool_context.load_artifact("attachment_1")
+        return {"blocked": blocked, "data": artifact.inline_data.data.decode()}
+
+    llm = ScriptedLlm(
+        turns=[
+            call_turn("try_overwrite", {}),
+            text_turn("Protected."),
+            text_turn("Replayed."),
+        ],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[try_overwrite]),
+        app_name="test-app",
+        input_file_routes={"reference": ".txt"},
+    )
+    client = TestClient(create_app(adapter))
+    first = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "b3JpZ2luYWw=",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+
+    assert first["status"] == "completed"
+    assert '"blocked": true' in first["output"][1]["output"]
+    assert '"data": "original"' in first["output"][1]["output"]
+    assert all(item["type"] != "ajac-zero:artifact" for item in first["output"])
+
+    adapter.session_service.sessions["test-app"]["default"].clear()
+    replay = client.post(
+        "/v1/responses",
+        json={"previous_response_id": first["id"], "input": "read it again"},
+    ).json()
+    assert replay["status"] == "completed"
+
+
 def test_input_file_routes_support_mixed_actions_and_longest_suffix():
     llm = ScriptedLlm(turns=[text_turn("Handled.")], requests=[])
     adapter = ADKAdapter(
@@ -1399,6 +1515,19 @@ def test_failed_fresh_run_cleans_up_default_input_artifacts():
     assert response.status_code == 500
     assert not adapter.session_service.sessions.get("test-app", {}).get("default", {})
     assert "attachment_1" not in str(adapter.artifact_service.artifacts)
+
+
+def test_artifact_registry_is_bounded_and_expires(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=1, ttl_seconds=10)
+    record = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    first = registry.register(record)
+    second = registry.register(record)
+    assert registry.get(first) is None
+    assert registry.get(second) is record
+    now["value"] = 11
+    assert registry.get(second) is None
 
 
 def test_multimodal_history_replay_preserves_images():
