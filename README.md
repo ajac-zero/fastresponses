@@ -34,11 +34,45 @@ with zero custom integration.
   are surfaced as provider-neutral, canonical `function_call` /
   `function_call_output` pairs. This replaces the earlier `adk:function_call`
   extension wire format.
-- **Brokered input attachments**: standard `input_file.file_url` capabilities are
-  fetched only from an explicit origin allowlist, bounded by timeout, redirect, and
-  byte-limit checks. Every redirect target must satisfy the same policy. The
-  capability URL is removed and the downloaded bytes are passed to ADK as normal
-  inline input, without adding tools or otherwise modifying the supplied agent.
+- **Routed input attachments**: configure grouped extension routes for `inline`,
+  `url`, `reference`, or `reject` handling. For example,
+  `{"inline": [".pdf", ".png"], "reference": [".docx", ".zip"]}`. Matching is
+  case-insensitive and longest-suffix-first. Unknown extensions use the explicit
+  `default_input_file_action` (`reject` by default).
+- `inline` and `reference` URL inputs are fetched only from an explicit origin
+  allowlist, bounded by timeout, redirects, 32 MiB per file, 16 files, and 64 MiB
+  of decoded file data per request. Lost-session replay is separately bounded to
+  64 files and 128 MiB. `url` inputs count toward file-count limits but not decoded
+  byte limits. `url` inputs are validated
+  against the allowlist and passed through without fetching; because the model
+  provider performs that fetch, redirect enforcement is also provider-owned. The built-in
+  `ADKArtifactInputFileStore` preserves `attachment_N` references; a custom
+  `InputFileReferenceStore` controls storage and the exact text shown to the model.
+  FastResponses never injects a loader, tool, plugin, or retrieval instructions.
+
+  ```python
+  adapter = ADKAdapter(
+      agent,
+      input_file_url_origins=["https://files.example"],
+      input_file_routes={
+          "inline": [".pdf", ".png", ".jpg"],
+          "url": [".mp3", ".mp4"],
+          "reference": [".docx", ".xlsx", ".zip", ".tar.gz"],
+      },
+      default_input_file_action="reject",
+  )
+  ```
+
+  Supply `input_file_router` instead of `input_file_routes` for per-file dynamic
+  decisions, or `input_file_reference_store` to own reference persistence and
+  formatting. Routes use the client-asserted filename as dispatch metadata; they
+  do not verify the file's actual type. A `url` route requires `file_url`; it never
+  falls back for `file_data`. Routers and stores are trusted application code and
+  must be deterministic and replay-safe; stores should treat `reference_id` writes
+  as idempotent because lost-session recovery can recreate historical references.
+  Sequential `attachment_N` allocation is coordinated within one adapter process;
+  deployments sharing ADK sessions across workers should provide external
+  serialization or a custom store/reference scheme with collision-resistant IDs.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
@@ -49,8 +83,9 @@ with zero custom integration.
   ADK. `allowed_tools` is enforced server-side as a hard constraint: calls to
   tools outside the allowed set are suppressed before execution.
 - **Multimodal input**: `input_image` and `input_file` parts are translated to
-  genai parts in fresh input and replayed history. ADK `input_file.file_url` fetching
-  is provider-controlled and disabled unless its origin is explicitly allowed.
+  genai parts in fresh input and replayed history. `url` routes delegate fetching
+  to the provider; `inline` and `reference` routes use FastResponses' bounded fetcher.
+  Remote inputs are disabled unless their origin is explicitly allowed.
 - **Structured output**: `text.format` `json_schema` / `json_object` map to
   the model's native JSON-schema-constrained decoding.
 - **`reasoning.effort` / `reasoning.summary`** map to a genai `ThinkingConfig`
