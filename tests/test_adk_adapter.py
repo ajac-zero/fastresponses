@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from unittest.mock import patch
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from google.adk.agents import Agent
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.adk.tools import ToolContext
 from google.genai import types
 
-from fastresponses.adapters.adk import ADKAdapter
+from fastresponses.adapters.adk import (
+    ADKAdapter,
+    InputFileContent,
+    InputFileReferenceContext,
+)
 from fastresponses.server import create_app
 
 from conftest import read_sse
+
+
+@asynccontextmanager
+async def _async_context(value):
+    yield value
 
 
 def usage(prompt=10, output=5):
@@ -53,9 +67,7 @@ def call_turn(name: str, args: dict) -> list[LlmResponse]:
             content=types.Content(
                 role="model",
                 parts=[
-                    types.Part(
-                        function_call=types.FunctionCall(name=name, args=args)
-                    )
+                    types.Part(function_call=types.FunctionCall(name=name, args=args))
                 ],
             ),
             usage_metadata=usage(),
@@ -117,9 +129,7 @@ def test_streaming_deltas_are_not_duplicated_by_final_event():
     ) as r:
         events = read_sse(r)
     payloads = [e for e in events if isinstance(e, dict)]
-    deltas = [
-        e["delta"] for e in payloads if e["type"] == "response.output_text.delta"
-    ]
+    deltas = [e["delta"] for e in payloads if e["type"] == "response.output_text.delta"]
     assert deltas == ["Hello", " world"]
     final = payloads[-1]["response"]
     assert final["output"][0]["content"][0]["text"] == "Hello world"
@@ -235,11 +245,15 @@ def test_streamed_thoughts_become_reasoning_item():
         ),
         LlmResponse(
             partial=True,
-            content=types.Content(role="model", parts=[thought_part("Tokyo is in Japan.")]),
+            content=types.Content(
+                role="model", parts=[thought_part("Tokyo is in Japan.")]
+            ),
         ),
         LlmResponse(
             partial=True,
-            content=types.Content(role="model", parts=[types.Part(text="It is sunny.")]),
+            content=types.Content(
+                role="model", parts=[types.Part(text="It is sunny.")]
+            ),
         ),
         LlmResponse(
             partial=False,
@@ -321,10 +335,7 @@ def test_previous_response_id_reuses_session_history():
     # second LLM call sees prior user + assistant turns from the ADK session
     contents = llm.requests[-1].contents
     texts = [
-        part.text
-        for content in contents
-        for part in (content.parts or [])
-        if part.text
+        part.text for content in contents for part in (content.parts or []) if part.text
     ]
     assert "what color is the sky?" in texts
     assert "Blue." in texts
@@ -607,7 +618,12 @@ def test_input_image_http_url_becomes_file_data():
 
 
 def test_input_file_base64_becomes_inline_data():
-    client, llm = make_adk_client([text_turn("A doc.")])
+    llm = ScriptedLlm(turns=[text_turn("A doc.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        input_file_routes={"inline": ".pdf"},
+    )
+    client = TestClient(create_app(adapter))
     client.post(
         "/v1/responses",
         json={
@@ -629,7 +645,690 @@ def test_input_file_base64_becomes_inline_data():
     )
     blob = llm.requests[0].contents[-1].parts[1].inline_data
     assert blob is not None
+    assert blob.display_name == "notes.pdf"
     assert blob.mime_type == "application/pdf"
+
+
+def test_input_file_url_is_fetched_and_hidden_from_model():
+    llm = ScriptedLlm(turns=[text_turn("Read.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        app_name="test-app",
+        input_file_url_origins=["https://parley.example"],
+        input_file_routes={"inline": ".pdf"},
+    )
+    client = TestClient(create_app(adapter))
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/pdf", "content-length": "4"},
+        content=b"data",
+    )
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(response)):
+        body = client.post(
+            "/v1/responses",
+            json={
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": "notes.pdf",
+                                "file_url": "https://parley.example/capability",
+                            }
+                        ],
+                    }
+                ]
+            },
+        ).json()
+
+    assert body["status"] == "completed"
+    blob = llm.requests[0].contents[-1].parts[0].inline_data
+    assert blob is not None
+    assert blob.data == b"data"
+    assert blob.display_name == "notes.pdf"
+    assert blob.mime_type == "application/pdf"
+    assert all(
+        not part.file_data
+        for content in llm.requests[0].contents
+        for part in content.parts or []
+    )
+
+
+def _url_file_client(
+    *turns,
+    origins=("https://files.example",),
+    routes={"inline": [".pdf", ".txt"]},
+    default_action="inline",
+):
+    llm = ScriptedLlm(turns=list(turns) or [text_turn("Read.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        app_name="test-app",
+        input_file_url_origins=origins,
+        input_file_routes=routes,
+        default_input_file_action=default_action,
+    )
+    return TestClient(create_app(adapter)), llm
+
+
+def _url_file_payload(*, filename: str | None = None):
+    part = {
+        "type": "input_file",
+        "file_url": "https://files.example/download",
+    }
+    if filename is not None:
+        part["filename"] = filename
+    return {
+        "input": [{"type": "message", "role": "user", "content": [part]}]
+    }
+
+
+def test_input_file_url_uses_response_mime_and_allows_missing_filename():
+    client, llm = _url_file_client()
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/pdf; charset=binary"},
+        content=b"pdf",
+    )
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(response)):
+        body = client.post("/v1/responses", json=_url_file_payload()).json()
+
+    assert body["status"] == "completed"
+    blob = llm.requests[0].contents[-1].parts[0].inline_data
+    assert blob.display_name == "attachment.pdf"
+    assert blob.mime_type == "application/pdf"
+
+
+def test_input_file_url_response_mime_overrides_filename_guess():
+    client, llm = _url_file_client()
+    response = httpx.Response(
+        200, headers={"content-type": "application/pdf"}, content=b"pdf"
+    )
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(response)):
+        body = client.post(
+            "/v1/responses", json=_url_file_payload(filename="misleading.txt")
+        ).json()
+
+    assert body["status"] == "completed"
+    blob = llm.requests[0].contents[-1].parts[0].inline_data
+    assert blob.display_name == "misleading.txt"
+    assert blob.mime_type == "application/pdf"
+
+
+def test_input_file_url_follows_allowlisted_relative_redirect():
+    client, llm = _url_file_client()
+    redirect = httpx.Response(302, headers={"location": "/object"})
+    final = httpx.Response(
+        200, headers={"content-type": "text/plain"}, content=b"data"
+    )
+    with patch(
+        "httpx.AsyncClient.stream",
+        side_effect=[_async_context(redirect), _async_context(final)],
+    ) as stream:
+        body = client.post("/v1/responses", json=_url_file_payload()).json()
+
+    assert body["status"] == "completed"
+    assert str(stream.call_args_list[1].args[1]) == "https://files.example/object"
+    assert llm.requests[0].contents[-1].parts[0].inline_data.mime_type == "text/plain"
+
+
+def test_input_file_url_rejects_redirect_to_unlisted_origin():
+    client, llm = _url_file_client()
+    redirect = httpx.Response(
+        302, headers={"location": "https://storage.example/object"}
+    )
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(redirect)):
+        response = client.post("/v1/responses", json=_url_file_payload())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Input file URL origin is not allowed."
+    assert llm.requests == []
+
+
+def test_input_file_url_rejects_stored_url_when_session_is_lost():
+    client, llm = _url_file_client(text_turn("Read."), text_turn("Again."))
+    downloaded = httpx.Response(
+        200, headers={"content-type": "text/plain"}, content=b"data"
+    )
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(downloaded)):
+        first = client.post("/v1/responses", json=_url_file_payload()).json()
+
+    adapter = client.app.state.adapter
+    adapter.session_service.sessions["test-app"]["default"].clear()
+    adapter.input_file_url_origins = frozenset()
+    response = client.post(
+        "/v1/responses",
+        json={"previous_response_id": first["id"], "input": "read it again"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Input file URL origin is not allowed."
+    assert len(llm.requests) == 1
+
+
+def test_input_file_url_accepts_allowlisted_ipv6_loopback():
+    client, llm = _url_file_client(origins=("http://[::1]",))
+    response = httpx.Response(
+        200, headers={"content-type": "text/plain"}, content=b"data"
+    )
+    payload = _url_file_payload(filename="notes.txt")
+    payload["input"][0]["content"][0]["file_url"] = "http://[::1]/download"
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(response)):
+        body = client.post("/v1/responses", json=payload).json()
+
+    assert body["status"] == "completed"
+    blob = llm.requests[0].contents[-1].parts[0].inline_data
+    assert blob.data == b"data"
+    assert blob.display_name == "notes.txt"
+
+
+def test_input_file_routes_support_mixed_actions_and_longest_suffix():
+    llm = ScriptedLlm(turns=[text_turn("Handled.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        app_name="test-app",
+        input_file_url_origins=["https://files.example"],
+        input_file_routes={
+            "inline": ["PDF", ".tar.gz"],
+            "url": "mp4",
+            "reference": [".docx", ".gz"],
+        },
+        default_input_file_action="reject",
+    )
+    client = TestClient(create_app(adapter))
+    response = httpx.Response(
+        200, headers={"content-type": "application/gzip"}, content=b"archive"
+    )
+    payload = {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "bundle.TAR.GZ",
+                        "file_url": "https://files.example/archive",
+                    },
+                    {
+                        "type": "input_file",
+                        "filename": "clip.mp4",
+                        "file_url": "https://files.example/clip",
+                    },
+                    {
+                        "type": "input_file",
+                        "filename": "report.docx",
+                        "file_data": "ZGF0YQ==",
+                    },
+                ],
+            }
+        ]
+    }
+    with patch("httpx.AsyncClient.stream", return_value=_async_context(response)) as stream:
+        body = client.post("/v1/responses", json=payload).json()
+
+    assert body["status"] == "completed"
+    assert stream.call_count == 1
+    parts = llm.requests[0].contents[-1].parts
+    assert parts[0].inline_data.data == b"archive"
+    assert parts[1].file_data.file_uri == "https://files.example/clip"
+    assert parts[2].text == (
+        '[Uploaded Artifact: {"artifact_id":"attachment_1",'
+        '"filename":"report.docx","mime_type":'
+        '"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}]'
+    )
+    stored = client.app.state.adapter.input_file_reference_store.artifact_service
+    assert "attachment_1" in str(stored.artifacts)
+    assert "report.docx" in str(stored.artifacts)
+
+
+def test_input_file_reference_store_controls_model_text():
+    class Store:
+        calls: list[tuple[InputFileContent, InputFileReferenceContext]] = []
+
+        async def create_reference(self, file, *, context):
+            self.calls.append((file, context))
+            return f"custom://{context.reference_id}/{file.filename}"
+
+    store = Store()
+    llm = ScriptedLlm(turns=[text_turn("Handled.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        input_file_routes={"reference": ".zip"},
+        input_file_reference_store=store,
+    )
+    client = TestClient(create_app(adapter))
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "source.zip",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+
+    assert body["status"] == "completed"
+    assert llm.requests[0].contents[-1].parts[0].text == "custom://attachment_1/source.zip"
+    assert store.calls[0][0].data == b"data"
+    assert store.calls[0][1].app_name == "fastresponses"
+
+
+def test_input_file_reference_ids_continue_across_turns():
+    store_calls = []
+
+    class Store:
+        async def create_reference(self, file, *, context):
+            store_calls.append(context.reference_id)
+            return context.reference_id
+
+    llm = ScriptedLlm(
+        turns=[text_turn("First."), text_turn("Second.")], requests=[]
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        input_file_routes={"reference": ".zip"},
+        input_file_reference_store=Store(),
+    )
+    client = TestClient(create_app(adapter))
+
+    first = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "first.zip",
+                            "file_data": "MQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+    second = client.post(
+        "/v1/responses",
+        json={
+            "previous_response_id": first["id"],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "second.zip",
+                            "file_data": "Mg==",
+                        }
+                    ],
+                }
+            ],
+        },
+    ).json()
+
+    assert second["status"] == "completed"
+    assert store_calls == ["attachment_1", "attachment_2"]
+    assert llm.requests[1].contents[-1].parts[0].text == "attachment_2"
+
+
+def test_default_reference_store_is_available_to_agent_tools():
+    async def inspect_attachment(tool_context: ToolContext) -> dict:
+        """Inspect the uploaded attachment."""
+        artifact = await tool_context.load_artifact("attachment_1")
+        return {"data": artifact.inline_data.data.decode()}
+
+    llm = ScriptedLlm(
+        turns=[
+            call_turn("inspect_attachment", {}),
+            text_turn("Loaded."),
+        ],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[inspect_attachment]),
+        input_file_routes={"reference": ".txt"},
+    )
+    client = TestClient(create_app(adapter))
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "aGVsbG8=",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+
+    assert body["status"] == "completed"
+    assert '"data": "hello"' in body["output"][1]["output"]
+
+
+def test_input_file_route_configuration_is_strict():
+    agent = Agent(name="test_agent", model=ScriptedLlm(turns=[], requests=[]))
+    with pytest.raises(ValueError, match="routed to both"):
+        ADKAdapter(
+            agent,
+            input_file_routes={"inline": ".pdf", "reference": "PDF"},
+        )
+    with pytest.raises(ValueError, match="not both"):
+        ADKAdapter(
+            agent,
+            input_file_routes={"inline": ".pdf"},
+            input_file_router=lambda _: "inline",
+        )
+    with pytest.raises(ValueError, match="Unknown input file action"):
+        ADKAdapter(agent, default_input_file_action="guess")
+    with pytest.raises(ValueError, match="must not be empty"):
+        ADKAdapter(agent, input_file_routes={"inline": ""})
+
+
+def test_input_file_default_action_rejects_unknown_extension():
+    client, llm = _url_file_client(
+        routes={"inline": ".pdf"}, default_action="reject"
+    )
+    response = client.post(
+        "/v1/responses", json=_url_file_payload(filename="payload.exe")
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_file_type"
+    assert llm.requests == []
+    sessions = client.app.state.adapter.session_service.sessions
+    assert not sessions.get("test-app", {}).get("default", {})
+
+
+def test_input_file_explicit_reject_route_and_url_source_validation():
+    client, llm = _url_file_client(
+        routes={"url": ".mp4", "reject": ".exe"}, default_action="inline"
+    )
+    rejected = client.post(
+        "/v1/responses", json=_url_file_payload(filename="payload.exe")
+    )
+    missing_url = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "clip.mp4",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "unsupported_file_type"
+    assert missing_url.status_code == 400
+    assert "must provide file_url" in missing_url.json()["error"]["message"]
+    assert llm.requests == []
+
+
+def test_input_file_rejects_dual_sources():
+    client, llm = _url_file_client(routes={"url": ".mp4"})
+    payload = _url_file_payload(filename="clip.mp4")
+    payload["input"][0]["content"][0]["file_data"] = "ZGF0YQ=="
+    response = client.post("/v1/responses", json=payload)
+
+    assert response.status_code == 400
+    assert "both file_data and file_url" in response.json()["error"]["message"]
+    assert llm.requests == []
+
+
+def test_input_file_rejects_malformed_url_as_invalid_request():
+    client, llm = _url_file_client(routes={"url": ".mp4"})
+    payload = _url_file_payload(filename="clip.mp4")
+    payload["input"][0]["content"][0]["file_url"] = (
+        "https://files.example:bad/clip"
+    )
+    response = client.post("/v1/responses", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Input file URL is invalid."
+    assert llm.requests == []
+
+
+def test_input_file_accepts_empty_base64_inline():
+    llm = ScriptedLlm(turns=[text_turn("Empty.")], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        input_file_routes={"inline": ".txt"},
+    )
+    client = TestClient(create_app(adapter))
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "empty.txt",
+                            "file_data": "",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+
+    assert body["status"] == "completed"
+    assert llm.requests[0].contents[-1].parts[0].inline_data.data == b""
+
+
+def test_input_file_rejects_empty_reference():
+    llm = ScriptedLlm(turns=[text_turn("No.")], requests=[])
+    client = TestClient(
+        create_app(
+            ADKAdapter(
+                Agent(name="test_agent", model=llm),
+                input_file_routes={"reference": ".txt"},
+            )
+        )
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "empty.txt",
+                            "file_data": "",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert "must not be empty" in response.json()["error"]["message"]
+    assert llm.requests == []
+
+
+def test_input_file_router_supports_async_and_rejects_invalid_action():
+    async def inline(_):
+        return "inline"
+
+    llm = ScriptedLlm(turns=[text_turn("Read.")], requests=[])
+    client = TestClient(
+        create_app(
+            ADKAdapter(
+                Agent(name="test_agent", model=llm), input_file_router=inline
+            )
+        )
+    )
+    body = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    ).json()
+    assert body["status"] == "completed"
+
+    bad_client = TestClient(
+        create_app(
+            ADKAdapter(
+                Agent(
+                    name="bad_agent",
+                    model=ScriptedLlm(turns=[text_turn("No.")], requests=[]),
+                ),
+                input_file_router=lambda _: "guess",
+            )
+        )
+    )
+    response = bad_client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400
+    assert "Unknown input file action" in response.json()["error"]["message"]
+
+
+def test_input_file_rejects_file_id_explicitly():
+    client, llm = _url_file_client()
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_id": "file_123",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_parameter"
+    assert llm.requests == []
+
+
+def test_input_file_callback_failures_are_sanitized():
+    def fail_router(_):
+        raise RuntimeError("secret router detail")
+
+    client = TestClient(
+        create_app(
+            ADKAdapter(
+                Agent(
+                    name="test_agent",
+                    model=ScriptedLlm(turns=[text_turn("No.")], requests=[]),
+                ),
+                input_file_router=fail_router,
+            )
+        )
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == "Input file router failed."
+    assert "secret" not in response.text
+
+
+def test_failed_fresh_run_cleans_up_default_input_artifacts():
+    llm = ScriptedLlm(turns=[], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        app_name="test-app",
+        input_file_routes={"reference": ".txt"},
+    )
+    client = TestClient(create_app(adapter))
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": "ZGF0YQ==",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 500
+    assert not adapter.session_service.sessions.get("test-app", {}).get("default", {})
+    assert "attachment_1" not in str(adapter.artifact_service.artifacts)
 
 
 def test_multimodal_history_replay_preserves_images():
@@ -725,9 +1424,7 @@ def test_max_tokens_finish_reason_marks_incomplete():
     truncated = [
         LlmResponse(
             partial=False,
-            content=types.Content(
-                role="model", parts=[types.Part(text="Once upon a")]
-            ),
+            content=types.Content(role="model", parts=[types.Part(text="Once upon a")]),
             finish_reason=types.FinishReason.MAX_TOKENS,
             usage_metadata=usage(),
         )

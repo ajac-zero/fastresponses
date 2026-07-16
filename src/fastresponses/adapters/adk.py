@@ -21,16 +21,21 @@ Open Responses provider:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
 import uuid
-from collections.abc import AsyncIterator
-from typing import Any
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
 
+import httpx
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.adk.events import Event
+from google.adk.artifacts import BaseArtifactService, InMemoryArtifactService
+from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, InMemorySessionService, Session
 from google.adk.tools import BaseTool, ToolContext
@@ -70,6 +75,217 @@ from ..models import (
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+_MAX_INPUT_FILE_BYTES = 32 * 1024 * 1024
+_MAX_INPUT_FILES = 16
+_MAX_INPUT_FILES_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_REPLAY_INPUT_FILES = 64
+_MAX_REPLAY_INPUT_FILES_TOTAL_BYTES = 128 * 1024 * 1024
+_MAX_INPUT_FILE_REDIRECTS = 3
+_GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
+_INPUT_COUNTER_KEY = "fastresponses:input_attachment_counter"
+
+InputFileAction = Literal["inline", "url", "reference", "reject"]
+InputFileRouter = Callable[[InputFile], InputFileAction | Awaitable[InputFileAction]]
+
+
+@dataclass(frozen=True)
+class InputFileContent:
+    """A downloaded or decoded input file passed to a reference store."""
+
+    filename: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class InputFileReferenceContext:
+    """Framework context and adapter-allocated ID for an input reference."""
+
+    app_name: str
+    user_id: str
+    session_id: str
+    reference_id: str
+
+
+class InputFileReferenceStore(Protocol):
+    async def create_reference(
+        self, file: InputFileContent, *, context: InputFileReferenceContext
+    ) -> str:
+        """Store a file and return the exact text shown to the model."""
+        ...
+
+
+class ADKArtifactInputFileStore:
+    """Store referenced inputs in ADK's artifact service."""
+
+    def __init__(self, artifact_service: BaseArtifactService | None = None) -> None:
+        self.artifact_service = artifact_service or InMemoryArtifactService()
+
+    async def create_reference(
+        self, file: InputFileContent, *, context: InputFileReferenceContext
+    ) -> str:
+        existing = await self.artifact_service.load_artifact(
+            app_name=context.app_name,
+            user_id=context.user_id,
+            session_id=context.session_id,
+            filename=context.reference_id,
+        )
+        if existing is not None:
+            blob = existing.inline_data
+            if (
+                blob is None
+                or blob.data != file.data
+                or blob.mime_type != file.mime_type
+                or blob.display_name != file.filename
+            ):
+                raise ValueError(
+                    f"Input artifact {context.reference_id!r} already contains "
+                    "different content."
+                )
+        else:
+            await self.artifact_service.save_artifact(
+                app_name=context.app_name,
+                user_id=context.user_id,
+                session_id=context.session_id,
+                filename=context.reference_id,
+                artifact=types.Part(
+                    inline_data=types.Blob(
+                        data=file.data,
+                        mime_type=file.mime_type,
+                        display_name=file.filename,
+                    )
+                ),
+            )
+        reference = {
+            "artifact_id": context.reference_id,
+            "filename": file.filename,
+            "mime_type": file.mime_type,
+        }
+        return "[Uploaded Artifact: " + json.dumps(
+            reference, separators=(",", ":"), sort_keys=True
+        ) + "]"
+
+
+def _validate_input_file_url(url: str, allowed_origins: frozenset[str]) -> httpx.URL:
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError) as exc:
+        raise AdapterError(
+            "Input file URL is invalid.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        ) from exc
+    if parsed.userinfo:
+        raise AdapterError(
+            "Input file URLs must not contain credentials.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.host in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise AdapterError(
+            "Input file URLs must use HTTPS.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    origin = str(parsed.copy_with(path="", query=None, fragment=None)).rstrip("/")
+    if origin not in allowed_origins:
+        raise AdapterError(
+            "Input file URL origin is not allowed.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
+    return parsed
+
+
+def _response_mime_type(response: httpx.Response, filename: str | None) -> str:
+    content_type = response.headers.get("content-type", "")
+    mime_type = content_type.partition(";")[0].strip().lower()
+    if mime_type not in _GENERIC_MIME_TYPES and "/" in mime_type:
+        return mime_type
+    return _guess_mime(filename)
+
+
+async def _fetch_input_file(
+    url: str, filename: str | None, allowed_origins: frozenset[str]
+) -> tuple[bytes, str]:
+    current = _validate_input_file_url(url, allowed_origins)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            for redirects in range(_MAX_INPUT_FILE_REDIRECTS + 1):
+                async with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise AdapterError(
+                                "Input file redirect is missing Location.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        if redirects == _MAX_INPUT_FILE_REDIRECTS:
+                            raise AdapterError(
+                                "Input file exceeded the redirect limit.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        current = _validate_input_file_url(
+                            str(current.join(location)), allowed_origins
+                        )
+                        continue
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise AdapterError(
+                            f"Input file download returned HTTP {response.status_code}.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    declared = response.headers.get("content-length")
+                    if declared is not None and int(declared) > _MAX_INPUT_FILE_BYTES:
+                        raise AdapterError(
+                            "Input file exceeds the maximum size.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > _MAX_INPUT_FILE_BYTES:
+                            raise AdapterError(
+                                "Input file exceeds the maximum size.",
+                                type="invalid_request",
+                                code="invalid_value",
+                                param="input",
+                            )
+                        chunks.append(chunk)
+                    if declared is not None and size != int(declared):
+                        raise AdapterError(
+                            "Input file response was truncated.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    return b"".join(chunks), _response_mime_type(response, filename)
+        raise AssertionError("unreachable")
+    except AdapterError:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AdapterError(
+            f"Input file download failed: {exc}",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        ) from exc
 
 
 def _decode_data_url(url: str) -> types.Blob | None:
@@ -127,14 +343,16 @@ def _content_part_to_adk(part: Any) -> types.Part | None:
             )
         return None
     if isinstance(part, InputFile):
-        if part.file_data:
+        if part.file_data is not None:
             try:
                 data = base64.b64decode(part.file_data)
             except (ValueError, TypeError):
                 return None
             return types.Part(
                 inline_data=types.Blob(
-                    mime_type=_guess_mime(part.filename), data=data
+                    mime_type=part._download_mime_type or _guess_mime(part.filename),
+                    data=data,
+                    display_name=part.filename,
                 )
             )
         if part.file_url:
@@ -174,7 +392,9 @@ class ClientFunctionTool(BaseTool):
             parameters_json_schema=self._parameters,
         )
 
-    async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    async def run_async(
+        self, *, args: dict[str, Any], tool_context: ToolContext
+    ) -> Any:
         # Returning a falsy value from a long-running tool makes ADK skip the
         # function response and end the invocation: control yields back to us.
         return None
@@ -191,12 +411,74 @@ class ADKAdapter(AgentAdapter):
         *,
         app_name: str = "fastresponses",
         session_service: BaseSessionService | None = None,
+        artifact_service: BaseArtifactService | None = None,
         model_name: str | None = None,
+        input_file_url_origins: Iterable[str] = (),
+        input_file_routes: Mapping[InputFileAction, str | Iterable[str]] | None = None,
+        default_input_file_action: InputFileAction = "reject",
+        input_file_router: InputFileRouter | None = None,
+        input_file_reference_store: InputFileReferenceStore | None = None,
     ) -> None:
+        if input_file_routes is not None and input_file_router is not None:
+            raise ValueError("Configure input_file_routes or input_file_router, not both.")
+        self._validate_input_file_action(default_input_file_action)
         self.agent = agent
         self.app_name = app_name
         self.session_service = session_service or InMemorySessionService()
+        self.artifact_service = artifact_service or InMemoryArtifactService()
         self.default_model = model_name or self._infer_model_name(agent)
+        origins: set[str] = set()
+        for origin in input_file_url_origins:
+            parsed = httpx.URL(origin)
+            canonical = str(
+                parsed.copy_with(path="", query=None, fragment=None)
+            ).rstrip("/")
+            if (
+                not parsed.host
+                or parsed.userinfo
+                or parsed.scheme not in {"http", "https"}
+                or str(parsed).rstrip("/") != canonical
+            ):
+                raise ValueError(f"Input file URL origin is not canonical: {origin!r}.")
+            origins.add(canonical)
+        self.input_file_url_origins = frozenset(origins)
+        self.input_file_routes = self._normalize_input_file_routes(input_file_routes)
+        self.default_input_file_action = default_input_file_action
+        self.input_file_router = input_file_router
+        self.input_file_reference_store = input_file_reference_store or (
+            ADKArtifactInputFileStore(self.artifact_service)
+        )
+        self._input_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    @staticmethod
+    def _validate_input_file_action(action: str) -> None:
+        if action not in {"inline", "url", "reference", "reject"}:
+            raise ValueError(f"Unknown input file action: {action!r}.")
+
+    @classmethod
+    def _normalize_input_file_routes(
+        cls, routes: Mapping[InputFileAction, str | Iterable[str]] | None
+    ) -> tuple[tuple[str, InputFileAction], ...]:
+        normalized: dict[str, InputFileAction] = {}
+        for action, configured in (routes or {}).items():
+            cls._validate_input_file_action(action)
+            extensions = [configured] if isinstance(configured, str) else configured
+            for extension in extensions:
+                extension = extension.strip().lower()
+                if not extension:
+                    raise ValueError("Input file route extensions must not be empty.")
+                if not extension.startswith("."):
+                    extension = f".{extension}"
+                previous = normalized.get(extension)
+                if previous is not None:
+                    raise ValueError(
+                        f"Input file extension {extension!r} is routed to both "
+                        f"{previous!r} and {action!r}."
+                    )
+                normalized[extension] = action
+        return tuple(sorted(normalized.items(), key=lambda route: len(route[0]), reverse=True))
 
     @staticmethod
     def _infer_model_name(agent: BaseAgent) -> str:
@@ -210,24 +492,119 @@ class ADKAdapter(AgentAdapter):
     # ------------------------------------------------------------------
 
     async def run(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
+        async for event in self._run_locked(run):
+            yield event
+
+    async def _run_locked(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
         state = dict(run.previous_state or {})
-        call_map: dict[str, dict[str, str]] = dict(state.get("call_ids") or {})
         user_id: str = state.get("user_id") or run.request.user or "default"
 
-        history, new_message = self._split_input(run.new_items, call_map)
-
         session = await self._resolve_session(state, user_id)
+        created_session = session is None
         if session is None:
-            # Fresh conversation (or lost session): replay full context.
             session = await self.session_service.create_session(
                 app_name=self.app_name,
                 user_id=user_id,
                 session_id=f"or-{uuid.uuid4().hex}",
             )
-            replay = run.context_items[: len(run.context_items) - len(run.new_items)]
+        lock = self._input_file_locks.setdefault(session.id, asyncio.Lock())
+        created_references: list[str] = []
+        references_committed = [False]
+        try:
+            async with lock:
+                refreshed = await self.session_service.get_session(
+                    app_name=self.app_name, user_id=user_id, session_id=session.id
+                )
+                if refreshed is not None:
+                    session = refreshed
+                async for event in self._run_in_session(
+                    run,
+                    state,
+                    user_id,
+                    session,
+                    created_references,
+                    references_committed,
+                ):
+                    yield event
+        except BaseException:
+            if (created_session or not references_committed[0]) and isinstance(
+                self.input_file_reference_store, ADKArtifactInputFileStore
+            ):
+                for reference_id in created_references:
+                    try:
+                        await self.artifact_service.delete_artifact(
+                            app_name=self.app_name,
+                            user_id=user_id,
+                            session_id=session.id,
+                            filename=reference_id,
+                        )
+                    except Exception:
+                        pass
+            if created_session:
+                try:
+                    await self.session_service.delete_session(
+                        app_name=self.app_name,
+                        user_id=user_id,
+                        session_id=session.id,
+                    )
+                except Exception:
+                    pass
+            raise
+
+    async def _run_in_session(
+        self,
+        run: AgentRun,
+        state: dict[str, Any],
+        user_id: str,
+        session: Session,
+        created_references: list[str],
+        references_committed: list[bool],
+    ) -> AsyncIterator[AdapterEvent]:
+        call_map: dict[str, dict[str, str]] = dict(state.get("call_ids") or {})
+        replay_items = run.context_items[: len(run.context_items) - len(run.new_items)]
+        self._validate_input_shape(run.new_items)
+        attachment_counter = int(session.state.get(_INPUT_COUNTER_KEY, 0))
+        replay: list[Item] = []
+        if not state.get("session_id") or state.get("session_id") != session.id:
+            # Fresh conversation (or lost session): replay full context first.
+            replay, attachment_counter = await self._prepare_input_files(
+                replay_items,
+                user_id,
+                session.id,
+                attachment_counter,
+                [0, 0],
+                max_files=_MAX_REPLAY_INPUT_FILES,
+                max_bytes=_MAX_REPLAY_INPUT_FILES_TOTAL_BYTES,
+                created_references=created_references,
+            )
+        input_file_budget = [0, 0]
+        hydrated_new, attachment_counter = await self._prepare_input_files(
+            run.new_items,
+            user_id,
+            session.id,
+            attachment_counter,
+            input_file_budget,
+            max_files=_MAX_INPUT_FILES,
+            max_bytes=_MAX_INPUT_FILES_TOTAL_BYTES,
+            created_references=created_references,
+        )
+        history, new_message = self._split_input(hydrated_new, call_map)
+        if replay:
             history = [*replay, *history]
 
         await self._seed_history(session, history, call_map)
+        if attachment_counter != int(session.state.get(_INPUT_COUNTER_KEY, 0)):
+            await self.session_service.append_event(
+                session,
+                Event(
+                    invocation_id=f"or-state-{uuid.uuid4().hex}",
+                    author="fastresponses",
+                    actions=EventActions(
+                        state_delta={_INPUT_COUNTER_KEY: attachment_counter}
+                    ),
+                ),
+            )
+        references_committed[0] = True
 
         client_tools = [ClientFunctionTool(t) for t in run.request.function_tools()]
         agent = self._configure_agent(run, client_tools)
@@ -235,6 +612,7 @@ class ADKAdapter(AgentAdapter):
             agent=agent,
             app_name=self.app_name,
             session_service=self.session_service,
+            artifact_service=self.artifact_service,
         )
 
         client_tool_names = {t.name for t in client_tools}
@@ -273,6 +651,218 @@ class ADKAdapter(AgentAdapter):
     # ------------------------------------------------------------------
     # Input translation
     # ------------------------------------------------------------------
+
+    async def _prepare_input_files(
+        self,
+        items: list[Item],
+        user_id: str,
+        session_id: str,
+        attachment_counter: int,
+        input_file_budget: list[int],
+        *,
+        max_files: int,
+        max_bytes: int,
+        created_references: list[str],
+    ) -> tuple[list[Item], int]:
+        prepared: list[Item] = []
+        pending_references: list[
+            tuple[list[Any], int, InputFileContent, InputFileReferenceContext]
+        ] = []
+        for item in items:
+            if not isinstance(item, MessageItem) or not isinstance(item.content, list):
+                prepared.append(item)
+                continue
+            content: list[Any] = []
+            for part in item.content:
+                if not isinstance(part, InputFile):
+                    content.append(part)
+                    continue
+                input_file_budget[0] += 1
+                if input_file_budget[0] > max_files:
+                    raise AdapterError(
+                        "Input contains too many files.",
+                        type="invalid_request",
+                        code="invalid_value",
+                        param="input",
+                    )
+                if part.file_data is not None and part.file_url is not None:
+                    raise AdapterError(
+                        "Input file must not provide both file_data and file_url.",
+                        type="invalid_request",
+                        code="invalid_value",
+                        param="input",
+                    )
+                if part.file_id is not None:
+                    raise AdapterError(
+                        "ADK input-file routing does not support file_id.",
+                        type="invalid_request",
+                        code="unsupported_parameter",
+                        param="input",
+                    )
+                try:
+                    action = await self._route_input_file(part)
+                except AdapterError:
+                    raise
+                except Exception as exc:
+                    raise AdapterError(
+                        "Input file router failed.",
+                        code="input_file_router_error",
+                    ) from exc
+                if action == "reject":
+                    raise AdapterError(
+                        f"Input file {part.filename or '<unnamed>'!r} is not allowed.",
+                        type="invalid_request",
+                        code="unsupported_file_type",
+                        param="input",
+                    )
+                if action == "url":
+                    if not part.file_url:
+                        raise AdapterError(
+                            "URL-routed input files must provide file_url.",
+                            type="invalid_request",
+                            code="invalid_value",
+                            param="input",
+                        )
+                    _validate_input_file_url(part.file_url, self.input_file_url_origins)
+                    content.append(part)
+                    continue
+                file = await self._read_input_file(part)
+                input_file_budget[1] += len(file.data)
+                if input_file_budget[1] > max_bytes:
+                    raise AdapterError(
+                        "Input files exceed the aggregate size limit.",
+                        type="invalid_request",
+                        code="invalid_value",
+                        param="input",
+                    )
+                if action == "inline":
+                    inline = part.model_copy(
+                        update={
+                            "filename": file.filename,
+                            "file_url": None,
+                            "file_data": _b64(file.data),
+                        }
+                    )
+                    inline._download_mime_type = file.mime_type
+                    content.append(inline)
+                    continue
+                if not file.data:
+                    raise AdapterError(
+                        "Reference-routed input files must not be empty.",
+                        type="invalid_request",
+                        code="invalid_value",
+                        param="input",
+                    )
+                attachment_counter += 1
+                index = len(content)
+                content.append(None)
+                pending_references.append(
+                    (
+                        content,
+                        index,
+                        file,
+                        InputFileReferenceContext(
+                            app_name=self.app_name,
+                            user_id=user_id,
+                            session_id=session_id,
+                            reference_id=f"attachment_{attachment_counter}",
+                        ),
+                    )
+                )
+            prepared.append(item.model_copy(update={"content": content}))
+        for content, index, file, context in pending_references:
+            try:
+                text = await self.input_file_reference_store.create_reference(
+                    file, context=context
+                )
+                if not isinstance(text, str):
+                    raise TypeError("create_reference() must return a string")
+                created_references.append(context.reference_id)
+            except Exception as exc:
+                raise AdapterError(
+                    "Input file reference store failed.",
+                    code="input_file_reference_store_error",
+                ) from exc
+            content[index] = InputText(text=text)
+        return prepared, attachment_counter
+
+    async def _route_input_file(self, part: InputFile) -> InputFileAction:
+        if self.input_file_router is not None:
+            action = self.input_file_router(part)
+            if isinstance(action, Awaitable):
+                action = await action
+            try:
+                self._validate_input_file_action(action)
+            except ValueError as exc:
+                raise AdapterError(
+                    str(exc),
+                    type="invalid_request",
+                    code="invalid_value",
+                    param="input",
+                ) from exc
+            return action
+        filename = (part.filename or "").lower()
+        for extension, action in self.input_file_routes:
+            if filename.endswith(extension):
+                return action
+        return self.default_input_file_action
+
+    async def _read_input_file(self, part: InputFile) -> InputFileContent:
+        if part.file_url:
+            data, mime_type = await _fetch_input_file(
+                part.file_url, part.filename, self.input_file_url_origins
+            )
+        elif part.file_data is not None:
+            try:
+                data = base64.b64decode(part.file_data, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise AdapterError(
+                    "Input file contains invalid base64 data.",
+                    type="invalid_request",
+                    code="invalid_value",
+                    param="input",
+                ) from exc
+            if len(data) > _MAX_INPUT_FILE_BYTES:
+                raise AdapterError(
+                    "Input file exceeds the maximum size.",
+                    type="invalid_request",
+                    code="invalid_value",
+                    param="input",
+                )
+            mime_type = _guess_mime(part.filename)
+        else:
+            raise AdapterError(
+                "Input file must provide file_data or file_url.",
+                type="invalid_request",
+                code="invalid_value",
+                param="input",
+            )
+        filename = part.filename
+        if not filename:
+            extension = mimetypes.guess_extension(mime_type) or ".bin"
+            filename = f"attachment{extension}"
+        return InputFileContent(filename=filename, mime_type=mime_type, data=data)
+
+    @staticmethod
+    def _validate_input_shape(items: list[Item]) -> None:
+        if not items:
+            raise AdapterError(
+                "Request 'input' must contain at least one item.",
+                type="invalid_request",
+                code="invalid_value",
+                param="input",
+            )
+        if isinstance(items[-1], MessageItem) and items[-1].role == "user":
+            return
+        if isinstance(items[-1], FunctionCallOutputItem):
+            return
+        raise AdapterError(
+            "Request 'input' must end with a user message or with "
+            "function_call_output items.",
+            type="invalid_request",
+            code="invalid_value",
+            param="input",
+        )
 
     def _split_input(
         self, items: list[Item], call_map: dict[str, dict[str, str]]
@@ -550,7 +1140,9 @@ class ADKAdapter(AgentAdapter):
 
     def _thinking_config(self, run: AgentRun) -> types.ThinkingConfig | None:
         reasoning = run.request.reasoning
-        if reasoning is None or (reasoning.effort is None and reasoning.summary is None):
+        if reasoning is None or (
+            reasoning.effort is None and reasoning.summary is None
+        ):
             return None
         include_thoughts = reasoning.summary is not None or (
             reasoning.effort is not None and reasoning.effort != "none"
@@ -685,7 +1277,9 @@ class _EventTranslator:
             out.append(ReasoningDelta(delta=thought_text))
             if signature:
                 out.append(ReasoningDelta(encrypted_content=_b64(signature)))
-        elif signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0:
+        elif (
+            signature and self._streamed_thought_chars > 0 and self._streamed_chars == 0
+        ):
             out.append(ReasoningDelta(encrypted_content=_b64(signature)))
         self._streamed_thought_chars = 0
         return out
