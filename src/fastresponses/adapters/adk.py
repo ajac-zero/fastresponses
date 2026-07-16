@@ -1319,8 +1319,7 @@ class _EventTranslator:
 
         if event.actions.artifact_delta:
             for filename, version in event.actions.artifact_delta.items():
-                if not filename.startswith("attachment_"):
-                    out.append(await self._artifact_item(filename, version))
+                out.append(await self._artifact_item(filename, version))
 
         usage = event.usage_metadata
         if usage is not None:
