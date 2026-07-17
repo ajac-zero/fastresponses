@@ -391,3 +391,31 @@ def test_content_disposition_empty_and_dot_only_names_fall_back():
     assert _content_disposition("") == 'attachment; filename="artifact"'
     assert _content_disposition("...") == 'attachment; filename="artifact"'
     assert _content_disposition("\r\n") == 'attachment; filename="artifact"'
+
+
+def test_content_disposition_path_separator_only_sanitization_omits_extended():
+    # Path separators are neutralized identically in both forms, so the
+    # extended parameter adds no information and must be omitted.
+    assert _content_disposition("a/b.txt") == 'attachment; filename="a_b.txt"'
+
+
+def test_content_disposition_percent_is_encoded_not_double_decoded():
+    header = _content_disposition("100%.txt")
+    assert header == (
+        'attachment; filename="100_.txt"; filename*=UTF-8\'\'100%25.txt'
+    )
+
+
+def test_content_disposition_drops_unicode_format_and_separator_characters():
+    # RTL override (spoofing), line separator, and zero-width space are all
+    # non-printable and must be dropped from both filename forms.
+    header = _content_disposition("exe\u202etxt.gpj\u2028\u200b.txt")
+    assert "\u202e" not in header
+    assert "\u2028" not in header
+    assert "\u200b" not in header
+    assert header == 'attachment; filename="exetxt.gpj.txt"'
+
+
+def test_content_disposition_header_value_is_always_latin1_encodable():
+    for name in ("报告.txt", "a\u202eb", "café/№∞.pdf", "", "\x00\x1f"):
+        _content_disposition(name).encode("latin-1")
