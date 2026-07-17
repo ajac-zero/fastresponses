@@ -10,17 +10,21 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from google.adk.agents import Agent
+from google.adk.artifacts import InMemoryArtifactService
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import ToolContext
 from google.genai import types
 
+from fastresponses.adapter import AdapterError
 from fastresponses.adapters.adk import (
     ADKAdapter,
     ADKToolResponse,
     InputFileContent,
     InputFileReferenceContext,
+    _EventTranslator,
+    _GeneratedArtifactPolicy,
 )
 from fastresponses.artifacts import ArtifactRecord, ArtifactRegistry
 from fastresponses.models import CustomItem
@@ -1811,6 +1815,191 @@ def test_adk_adapter_propagates_invalid_registry_limits():
         ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry_max_records=0)
     with pytest.raises(ValueError):
         ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry_ttl_seconds=0)
+
+
+def _policy_client(turns, tools, **adapter_kwargs):
+    llm = ScriptedLlm(turns=list(turns), requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=tools),
+        app_name="test-app",
+        **adapter_kwargs,
+    )
+    return TestClient(create_app(adapter)), adapter
+
+
+def test_oversized_tool_artifact_is_rejected_before_storage_and_download():
+    client, adapter = _policy_client(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        max_generated_artifact_bytes=8,
+    )
+    response = client.post("/v1/responses", json={"input": "make a report"})
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "artifact_too_large"
+    assert "report.txt" in error["message"]
+    # Nothing was stored and no public download ID was handed out.
+    assert adapter.artifact_registry._records == {}
+    keys = adapter.artifact_service.artifacts if hasattr(
+        adapter.artifact_service, "artifacts"
+    ) else {}
+    assert all("report.txt" not in key for key in keys)
+
+
+def test_compliant_tool_artifact_passes_configured_policies():
+    client, _ = _policy_client(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        max_generated_artifact_bytes=len(b"generated report"),
+        allowed_generated_artifact_mime_types=["text/plain"],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+
+    assert body["status"] == "completed"
+    artifact = next(
+        item for item in body["output"] if item["type"] == "ajac-zero:artifact"
+    )
+    download = client.get(artifact["content_url"])
+    assert download.content == b"generated report"
+
+
+def test_mime_denylist_rejects_tool_artifact_in_streaming_and_non_streaming():
+    make = lambda: _policy_client(  # noqa: E731
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        blocked_generated_artifact_mime_types=["text/*"],
+    )
+
+    client, adapter = make()
+    response = client.post("/v1/responses", json={"input": "make a report"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_mime_type_rejected"
+    assert adapter.artifact_registry._records == {}
+
+    client, adapter = make()
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "make a report", "stream": True}
+    ) as stream:
+        payloads = [event for event in read_sse(stream) if isinstance(event, dict)]
+    assert payloads[-1]["type"] == "response.failed"
+    assert payloads[-1]["response"]["error"]["code"] == "artifact_mime_type_rejected"
+    assert adapter.artifact_registry._records == {}
+
+
+def test_mime_allowlist_rejects_non_matching_tool_artifact():
+    client, adapter = _policy_client(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        allowed_generated_artifact_mime_types=["image/png", "application/pdf"],
+    )
+    response = client.post("/v1/responses", json={"input": "make a report"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_mime_type_rejected"
+    assert adapter.artifact_registry._records == {}
+
+
+def test_mapper_created_artifact_policy_rejection_keeps_canonical_pair():
+    async def mapper(response: ADKToolResponse):
+        return [await response.create_artifact("summary.bin", b"0" * 32, "text/plain")]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+        max_generated_artifact_bytes=16,
+    )
+    client = TestClient(create_app(adapter))
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "weather?", "stream": True}
+    ) as stream:
+        payloads = [event for event in read_sse(stream) if isinstance(event, dict)]
+
+    done_types = [
+        event["item"]["type"]
+        for event in payloads
+        if event["type"] == "response.output_item.done"
+    ]
+    assert done_types == ["function_call", "function_call_output"]
+    assert payloads[-1]["type"] == "response.failed"
+    assert payloads[-1]["response"]["error"]["code"] == "artifact_too_large"
+    # Rejected before storage: no artifact bytes and no download ID exist.
+    assert adapter.artifact_registry._records == {}
+    keys = adapter.artifact_service.artifacts if hasattr(
+        adapter.artifact_service, "artifacts"
+    ) else {}
+    assert all("summary.bin" not in key for key in keys)
+
+
+async def test_exposure_gate_never_registers_policy_violating_artifact():
+    service = InMemoryArtifactService()
+    await service.save_artifact(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        filename="big.bin",
+        artifact=types.Part.from_bytes(
+            data=b"0123456789", mime_type="application/octet-stream"
+        ),
+    )
+    registry = ArtifactRegistry()
+    translator = _EventTranslator(
+        set(),
+        {},
+        artifact_service=service,
+        artifact_registry=registry,
+        artifact_policy=_GeneratedArtifactPolicy(max_bytes=4),
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        internal_tool_response_mapper=None,
+    )
+
+    with pytest.raises(AdapterError) as err:
+        await translator._artifact_item("big.bin", 0)
+
+    assert err.value.code == "artifact_too_large"
+    assert err.value.type == "invalid_request"
+    assert registry._records == {}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_generated_artifact_bytes": 0},
+        {"max_generated_artifact_bytes": -1},
+        {"max_generated_artifact_bytes": float("nan")},
+        {"allowed_generated_artifact_mime_types": []},
+        {"allowed_generated_artifact_mime_types": ["text"]},
+        {"allowed_generated_artifact_mime_types": ["*/*"]},
+        {"blocked_generated_artifact_mime_types": ["not a mime type"]},
+        {"blocked_generated_artifact_mime_types": [""]},
+    ],
+)
+def test_adk_adapter_rejects_invalid_artifact_policy_configuration(kwargs):
+    llm = ScriptedLlm(turns=[], requests=[])
+    with pytest.raises(ValueError):
+        ADKAdapter(Agent(name="test_agent", model=llm), **kwargs)
+
+
+def test_artifact_mime_policy_normalizes_case_parameters_and_wildcards():
+    policy = _GeneratedArtifactPolicy(
+        allowed_mime_types=frozenset({"text/*"}),
+        blocked_mime_types=frozenset({"text/html"}),
+    )
+    policy.check("a.txt", 1, "Text/Plain; charset=utf-8")
+    with pytest.raises(ValueError) as err:
+        policy.check("a.html", 1, "text/html")
+    assert getattr(err.value, "code") == "artifact_mime_type_rejected"
+    with pytest.raises(ValueError):
+        policy.check("a.png", 1, "image/png")
+    with pytest.raises(ValueError):
+        policy.check("mystery", 1, None)
 
 
 def test_multimodal_history_replay_preserves_images():
