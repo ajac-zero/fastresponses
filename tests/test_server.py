@@ -9,6 +9,7 @@ from fastresponses.adapter import (
     UsageDelta,
 )
 from fastresponses.models import FunctionCallItem
+from fastresponses.server import _content_disposition
 
 from conftest import make_client, read_sse
 
@@ -342,3 +343,79 @@ def test_adapter_error_streaming_emits_error_then_failed():
     assert failed["status"] == "failed"
     assert failed["error"]["code"] == "boom"
     assert events[-1] == "[DONE]"
+
+
+def test_content_disposition_ascii_filename_has_no_extended_parameter():
+    assert _content_disposition("report.txt") == 'attachment; filename="report.txt"'
+
+
+def test_content_disposition_unicode_filename_adds_rfc5987_parameter():
+    header = _content_disposition("résumé 报告.txt")
+    assert header == (
+        'attachment; filename="r_sum_ __.txt"; '
+        "filename*=UTF-8''r%C3%A9sum%C3%A9%20%E6%8A%A5%E5%91%8A.txt"
+    )
+
+
+def test_content_disposition_quotes_and_separators_cannot_split_header():
+    header = _content_disposition('a"b;c.txt')
+    assert header == (
+        'attachment; filename="a_b_c.txt"; filename*=UTF-8\'\'a%22b%3Bc.txt'
+    )
+    assert '"a_b_c.txt"' in header
+    # No raw quote or separator survives outside the quoted fallback.
+    assert '"b' not in header.replace('filename="a_b_c.txt"', "")
+
+
+def test_content_disposition_strips_control_characters():
+    header = _content_disposition("evil\r\nSet-Cookie: x=1\x00\x1b.txt")
+    assert "\r" not in header
+    assert "\n" not in header
+    assert "\x00" not in header
+    assert "\x1b" not in header
+    assert header.startswith('attachment; filename="evilSet-Cookie_ x_1.txt"')
+    assert header.endswith("filename*=UTF-8''evilSet-Cookie%3A%20x%3D1.txt")
+
+
+def test_content_disposition_neutralizes_path_separators():
+    header = _content_disposition("../../etc/passwd")
+    assert header == 'attachment; filename="_.._etc_passwd"'
+
+
+def test_content_disposition_backslash_paths_are_neutralized():
+    header = _content_disposition("..\\..\\boot.ini")
+    assert header == 'attachment; filename="_.._boot.ini"'
+
+
+def test_content_disposition_empty_and_dot_only_names_fall_back():
+    assert _content_disposition("") == 'attachment; filename="artifact"'
+    assert _content_disposition("...") == 'attachment; filename="artifact"'
+    assert _content_disposition("\r\n") == 'attachment; filename="artifact"'
+
+
+def test_content_disposition_path_separator_only_sanitization_omits_extended():
+    # Path separators are neutralized identically in both forms, so the
+    # extended parameter adds no information and must be omitted.
+    assert _content_disposition("a/b.txt") == 'attachment; filename="a_b.txt"'
+
+
+def test_content_disposition_percent_is_encoded_not_double_decoded():
+    header = _content_disposition("100%.txt")
+    assert header == (
+        'attachment; filename="100_.txt"; filename*=UTF-8\'\'100%25.txt'
+    )
+
+
+def test_content_disposition_drops_unicode_format_and_separator_characters():
+    # RTL override (spoofing), line separator, and zero-width space are all
+    # non-printable and must be dropped from both filename forms.
+    header = _content_disposition("exe\u202etxt.gpj\u2028\u200b.txt")
+    assert "\u202e" not in header
+    assert "\u2028" not in header
+    assert "\u200b" not in header
+    assert header == 'attachment; filename="exetxt.gpj.txt"'
+
+
+def test_content_disposition_header_value_is_always_latin1_encodable():
+    for name in ("报告.txt", "a\u202eb", "café/№∞.pdf", "", "\x00\x1f"):
+        _content_disposition(name).encode("latin-1")
