@@ -104,7 +104,10 @@ with zero custom integration.
   filename-wide, so this keeps other registered versions downloadable. Public
   access is always removed before provider cleanup, so a cleanup failure never
   restores a revoked ID; the endpoint logs cleanup failures best-effort, while
-  `revoke_artifact` raises them so callers can retry. Deleting or cancelling a
+  `revoke_artifact` raises them. Failed cleanups stay retryable either way —
+  repeat the `DELETE` with `?delete_content=true`, or call `revoke_artifact`
+  again with `delete_content=True`, to re-attempt the deletion. Deleting or
+  cancelling a
   response does not revoke its artifacts, because artifact items may be
   replayed into forked or continued conversations; revoke IDs explicitly when
   they must stop resolving.
