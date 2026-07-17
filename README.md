@@ -133,6 +133,33 @@ with zero custom integration.
       allowed_generated_artifact_mime_types=["application/pdf", "image/*", "text/plain"],
   )
   ```
+- **Artifact expiration is surfaced, not silent**: every `ajac-zero:artifact`
+  item carries `expires_at` (Unix seconds, set when the item is created;
+  advisory — a wall-clock estimate, not an exact deadline) and `available`
+  (whether the download link is currently expected to work; the
+  authoritative signal). `GET /v1/responses/{id}`, `POST
+  /v1/responses/{id}/cancel`, and the final `response.completed` /
+  `.incomplete` / `.failed` snapshot of a non-background request (streamed
+  or not, including the WebSocket transport) all recompute these fields
+  against the live registry, so a response never keeps advertising a dead
+  link without saying so — including the narrow case where a same-turn
+  registry eviction (another artifact generated later in the same turn
+  pushing an earlier one out) would otherwise make the very first response a
+  client sees already stale. Every one of these is a live access: while a
+  registered artifact is still live, it extends its download window to a
+  fresh full TTL from that moment (sliding expiration) and advances
+  `expires_at` to match; once an artifact has expired, been evicted, or been
+  revoked, `available` flips to `false` and `content_url` returns
+  `artifact_not_found` like any other dead ID. By contrast,
+  `GET /v1/responses/{id}/events` and a background request's streamed
+  events replay a frozen, point-in-time event log for resumable streaming —
+  a replayed item's `available`/`expires_at` reflect its state when the
+  event was recorded, not the current state; use `GET /v1/responses/{id}`
+  for current availability. Response retention (how long the response
+  object stays in the response store) and artifact retention (how long its
+  download link keeps working) are independent: a response can outlive its
+  artifacts, and `store: false` responses are never persisted regardless of
+  artifact liveness.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached

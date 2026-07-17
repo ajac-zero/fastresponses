@@ -8,6 +8,11 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+#: ``type`` of the ``CustomItem`` used to surface downloadable generated
+#: artifacts. Shared between the ADK adapter (which creates the item) and
+#: the server (which reports live download availability on retrieval).
+ARTIFACT_TYPE = "ajac-zero:artifact"
+
 
 @dataclass(frozen=True)
 class ArtifactRecord:
@@ -48,6 +53,27 @@ class ArtifactRegistry:
         if expires_at <= time.monotonic():
             del self._records[artifact_id]
             return None
+        self._records.move_to_end(artifact_id)
+        return record
+
+    def refresh(self, artifact_id: str) -> ArtifactRecord | None:
+        """Extend a live record's expiry to a fresh full TTL from now.
+
+        Retrieving a stored response is treated as a live access: as long as
+        a client keeps fetching it, its artifact download links keep
+        working (sliding expiration) instead of dying on a fixed clock from
+        creation. Returns ``None`` for unknown, already-expired, or revoked
+        IDs, self-healing expired entries the same way :meth:`get` does, so
+        callers cannot distinguish those cases.
+        """
+        entry = self._records.get(artifact_id)
+        if entry is None:
+            return None
+        expires_at, record = entry
+        if expires_at <= time.monotonic():
+            del self._records[artifact_id]
+            return None
+        self._records[artifact_id] = (time.monotonic() + self.ttl_seconds, record)
         self._records.move_to_end(artifact_id)
         return record
 

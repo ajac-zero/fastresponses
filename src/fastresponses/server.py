@@ -41,11 +41,13 @@ from fastapi.responses import JSONResponse, Response as HttpResponse, StreamingR
 from pydantic import ValidationError
 
 from .adapter import AgentAdapter, AgentRun
+from .artifacts import ARTIFACT_TYPE, ArtifactRegistry
 from .compaction import compact_items
 from .engine import ResponseEngine, collect_response
 from .models import (
     ERROR_STATUS_CODES,
     CompactResource,
+    CustomItem,
     ErrorBody,
     ErrorEnvelope,
     ErrorEvent,
@@ -95,6 +97,94 @@ def _content_disposition(filename: str) -> str:
         encoded = quote(cleaned, safe=_RFC5987_ATTR_CHARS)
         header += f"; filename*=UTF-8''{encoded}"
     return header
+
+
+def _refresh_artifact_items(
+    response: Response, registry: ArtifactRegistry | None
+) -> Response:
+    """Report current download availability on ``ajac-zero:artifact`` items.
+
+    Used by every endpoint that returns a full, current snapshot of a stored
+    response (``GET /v1/responses/{id}`` and ``POST
+    /v1/responses/{id}/cancel``) so their artifact availability semantics
+    stay aligned. Retrieving a stored response this way is a live access, so
+    still-registered artifacts have their download window extended (sliding
+    TTL) and their ``expires_at`` advanced accordingly. Artifacts that are no
+    longer registered — expired, evicted by capacity, or explicitly revoked
+    — are reported with ``available: False`` rather than silently continuing
+    to advertise a dead ``content_url``. The registry is the sole source of
+    truth for availability and is never itself persisted, so this is
+    recomputed fresh on every retrieval; response retention (how long the
+    response object itself is stored) and artifact retention (how long its
+    download link keeps working) are independent guarantees.
+
+    ``expires_at`` is advisory: it is derived from a wall-clock read
+    (``time.time()``) taken alongside the registry's internal monotonic
+    deadline, so it approximates rather than guarantees the exact instant a
+    link stops resolving. ``available`` (recomputed from the registry on
+    every call) is the authoritative signal.
+
+    This does not apply to ``GET /v1/responses/{id}/events``: that endpoint
+    replays a historical, pre-framed event log for resumable streaming, so
+    an artifact item's fields there reflect its availability at the moment
+    the event was recorded, not at replay time. Call
+    ``GET /v1/responses/{id}`` for the current, live availability of a
+    response's artifacts.
+    """
+    if registry is None:
+        return response
+    output: list[Item] = []
+    changed = False
+    for item in response.output:
+        if (
+            isinstance(item, CustomItem)
+            and item.type == ARTIFACT_TYPE
+            and isinstance(item.id, str)
+        ):
+            record = registry.refresh(item.id)
+            update = (
+                {
+                    "available": True,
+                    "expires_at": int(time.time() + registry.ttl_seconds),
+                }
+                if record is not None
+                else {"available": False}
+            )
+            item = item.model_copy(update=update)
+            changed = True
+        output.append(item)
+    return response.model_copy(update={"output": output}) if changed else response
+
+
+async def _refresh_response_events(
+    events: AsyncIterator, registry: ArtifactRegistry | None
+) -> AsyncIterator:
+    """Apply live artifact-availability refresh to any event carrying a full
+    ``Response`` snapshot (``response.created``, ``.in_progress``,
+    ``.completed``, ``.incomplete``, ``.failed``).
+
+    A live (non-background) stream is generated and delivered in a single
+    pass, so without this a same-turn registry eviction — another artifact
+    generated later in the same turn pushing an earlier one out once
+    ``max_records`` is exceeded — could let the terminal event advertise an
+    artifact as ``available: true`` moments before its link actually stops
+    resolving. This mirrors ``GET``/``cancel`` treatment of stored responses
+    for the one response snapshot a non-background stream ever produces.
+    Background streaming is unaffected: its buffered/replayed events are
+    intentionally a frozen, point-in-time record (see
+    ``GET /v1/responses/{id}/events``).
+    """
+    if registry is None:
+        async for event in events:
+            yield event
+        return
+    async for event in events:
+        response = getattr(event, "response", None)
+        if isinstance(response, Response):
+            refreshed = _refresh_artifact_items(response, registry)
+            if refreshed is not response:
+                event = event.model_copy(update={"response": refreshed})
+        yield event
 
 
 def _event_json(event) -> str:
@@ -355,7 +445,11 @@ def create_app(
 
         if payload.stream:
             return StreamingResponse(
-                _sse(engine.events(run)),
+                _sse(
+                    _refresh_response_events(
+                        engine.events(run), app.state.artifact_registry
+                    )
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -369,6 +463,7 @@ def create_app(
                 code=response.error.code,
                 param=getattr(response.error, "param", None),
             )
+        response = _refresh_artifact_items(response, app.state.artifact_registry)
         return JSONResponse(content=response.model_dump(exclude_none=False))
 
     @app.post("/v1/responses/compact")
@@ -396,7 +491,8 @@ def create_app(
                 code="response_not_found",
                 param="response_id",
             )
-        return JSONResponse(content=stored.response.model_dump())
+        response = _refresh_artifact_items(stored.response, app.state.artifact_registry)
+        return JSONResponse(content=response.model_dump())
 
     @app.get("/v1/artifacts/{artifact_id}/content")
     async def get_artifact_content(artifact_id: str, request: Request):
@@ -530,14 +626,22 @@ def create_app(
             except asyncio.CancelledError:
                 pass
             stored = await response_store.get(response_id) or stored
-        return JSONResponse(content=stored.response.model_dump())
+        response = _refresh_artifact_items(stored.response, app.state.artifact_registry)
+        return JSONResponse(content=response.model_dump())
 
     @app.get("/v1/responses/{response_id}/events")
     async def stream_response_events(
         response_id: str, request: Request, starting_after: int = -1
     ):
         """Resume the event stream of a background response from a cursor
-        (``starting_after`` is the last ``sequence_number`` received)."""
+        (``starting_after`` is the last ``sequence_number`` received).
+
+        Replayed events are pre-framed at the moment they were recorded, so
+        any ``ajac-zero:artifact`` item's ``available``/``expires_at``
+        fields reflect its availability at recording time, not at replay
+        time. Use ``GET /v1/responses/{response_id}`` for current artifact
+        availability.
+        """
         await _authorize(request)
         bg: _BackgroundRun | None = app.state.background_runs.get(response_id)
         if bg is None:
@@ -658,7 +762,10 @@ def create_app(
             stored_holder.append(stored)
 
         failed = False
-        async for event in engine.events(run, on_stored=on_stored):
+        events = _refresh_response_events(
+            engine.events(run, on_stored=on_stored), app.state.artifact_registry
+        )
+        async for event in events:
             if isinstance(event, ErrorEvent):
                 # WebSocket failures are sent as a single error envelope
                 # instead of the SSE error + response.failed pair.
