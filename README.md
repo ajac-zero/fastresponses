@@ -479,7 +479,7 @@ for item in response["output"]:
 | `size` | `int` | always | Byte length of the artifact content (not characters). |
 | `content_url` | `str` | always | Always a **relative path** of the exact form `/v1/artifacts/{id}/content` — never an absolute URL. Resolve it against the same origin/base URL you used for the Responses API call. |
 | `available` | `bool` | always* | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older item predating this field) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
-| `expires_at` | `int` | always* | Unix seconds. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. Absent means unknown, not "never expires." |
+| `expires_at` | `int \| None` | always* | Unix seconds when present. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. `None`/absent means unknown, not "never expires" — treat it the same as an unknown `available`. |
 | `call_id` | `str` | conditional | Present **only** for mapper-created artifacts (see "Construction paths" below). Its absence is meaningful — it means the artifact was not produced in response to a specific internal tool call — not missing data. |
 
 \* Always present on items produced by the current adapter. `ArtifactItem`/`parse_artifact_item` default a missing `available` to `True` and a missing `expires_at` to `None` rather than raising, so older items predating these fields (e.g. replayed via `GET /v1/responses/{id}/events`, or read back from a response store populated by an earlier release) still parse — consistent with treating an absent `available` as best-effort-true.
@@ -546,10 +546,13 @@ re-verifying it — a cached `available: true` can silently go stale, while
 a cached `available: false` for the same `id` will not, since a
 revoked/evicted ID never comes back.
 
-The fields listed as "always" present will not be removed or repurposed
-without a breaking (major) release. `call_id` will continue to be present
-only when applicable. New, additive fields may appear in a future minor
-release; `ArtifactItem` (and `CustomItem` generally) is permissive
+Every field in the table above — including `available` and `expires_at`
+(the `"always*"` rows) — will not be removed or repurposed without a
+breaking (major) release; the `*` only means their *per-item presence* is
+tolerant of older data, not that the fields themselves are any less
+stable than the plain `"always"` ones. `call_id` will continue to be
+present only when applicable. New, additive fields may appear in a future
+minor release; `ArtifactItem` (and `CustomItem` generally) is permissive
 (`extra="allow"`), so unrecognized fields are preserved through
 round-tripping rather than rejected — forward-compatible consumers should
 do the same rather than assuming the field list above is exhaustive.
