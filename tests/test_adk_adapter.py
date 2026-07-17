@@ -1591,12 +1591,21 @@ def test_get_response_refreshes_and_expires_artifact_availability(monkeypatch):
 
 
 def test_session_generated_artifact_matches_documented_schema():
-    """save_artifact-triggered items never carry call_id."""
+    """save_artifact-triggered items still follow the same function_call/
+    function_call_output pair as any other tool call (README "Item ordering
+    examples"), but the artifact item itself never carries call_id."""
     client, _ = _make_artifact_adapter(
         [call_turn("save_report", {}), text_turn("Report ready.")],
         tools=[save_report],
     )
     body = client.post("/v1/responses", json={"input": "make a report"}).json()
+
+    assert [item["type"] for item in body["output"]] == [
+        "function_call",
+        "function_call_output",
+        "ajac-zero:artifact",
+        "message",
+    ]
     raw = _generated_artifacts(body)[0]
 
     artifact = parse_artifact_item(raw)

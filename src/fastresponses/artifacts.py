@@ -10,8 +10,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from .models import ItemStatus
-
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
 #: artifacts. Shared between the ADK adapter (which creates the item) and
 #: the server (which reports live download availability on retrieval).
@@ -60,7 +58,7 @@ class ArtifactItem(BaseModel):
 
     type: Literal["ajac-zero:artifact"] = ARTIFACT_TYPE
     id: str
-    status: ItemStatus | None = "completed"
+    status: Literal["completed"] = "completed"
     filename: str
     mime_type: str
     size: int

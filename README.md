@@ -493,13 +493,16 @@ differs:
 
 ### Item ordering examples
 
-Non-streaming, session-generated (agent's tool called `save_artifact`
-directly — no linkage to a specific call, so no adjacent function-call
-pair is guaranteed):
+Non-streaming, session-generated (a tool call's own `save_artifact` still
+produces the same `function_call`/`function_call_output` pair as any other
+tool call — the artifact item that follows just has no `call_id` linking
+it back to that pair):
 
 ```json
 {
   "output": [
+    { "type": "function_call", "call_id": "call_...", "name": "save_report", "...": "..." },
+    { "type": "function_call_output", "call_id": "call_...", "...": "..." },
     { "type": "ajac-zero:artifact", "id": "artifact_...", "filename": "report.txt", "...": "no call_id key present" },
     { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Report ready." }] }
   ]
@@ -521,13 +524,17 @@ response.completed         { ... }
 
 ### Mutability and backward compatibility
 
-`available`/`expires_at` are recomputed fresh on every live read (`GET
+`available` is recomputed fresh on every live read (`GET
 /v1/responses/{id}`, cancel, and the terminal event of a live create — see
-"Artifact expiration is surfaced, not silent" above); they are never
-pushed to a copy the client already holds. A client that caches an item
-(e.g. its own database) owns re-verifying it — a cached `available: true`
-can silently go stale, while a cached `available: false` for the same
-`id` will not, since a revoked/evicted ID never comes back.
+"Artifact expiration is surfaced, not silent" above). `expires_at` is
+refreshed alongside it only while the artifact is still available; once
+`available` flips to `false`, `expires_at` keeps its last-known (already
+past) value rather than being recomputed, so it should be ignored once
+`available` is `false`. Neither field is ever pushed to a copy the client
+already holds. A client that caches an item (e.g. its own database) owns
+re-verifying it — a cached `available: true` can silently go stale, while
+a cached `available: false` for the same `id` will not, since a
+revoked/evicted ID never comes back.
 
 The fields listed as "always" present will not be removed or repurposed
 without a breaking (major) release. `call_id` will continue to be present
