@@ -700,6 +700,38 @@ class ADKAdapter(AgentAdapter):
         async for event in self._run_locked(run):
             yield event
 
+    async def revoke_artifact(
+        self, artifact_id: str, *, delete_content: bool = False
+    ) -> bool:
+        """Revoke a generated artifact download ID.
+
+        Public access is removed first, so a revoked ID resolves to
+        ``artifact_not_found`` immediately and stays revoked even when
+        provider cleanup fails afterwards. Unlike the HTTP endpoint,
+        provider cleanup failures propagate to the caller so cleanup can
+        be retried.
+
+        With ``delete_content=True`` the provider bytes are also deleted,
+        unless another live download ID still references any version of the
+        same filename in the same scope: ADK artifact services delete every
+        version of a filename at once, so content deletion is skipped in
+        that case to keep unrelated versions downloadable.
+
+        Returns ``True`` when a live download ID was revoked and ``False``
+        for unknown, expired, or already-revoked IDs.
+        """
+        record = self.artifact_registry.revoke(artifact_id)
+        if record is None:
+            return False
+        if delete_content and not self.artifact_registry.has_live_reference(record):
+            await record.service.delete_artifact(
+                app_name=record.app_name,
+                user_id=record.user_id,
+                session_id=record.session_id,
+                filename=record.filename,
+            )
+        return True
+
     async def _run_locked(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
         state = dict(run.previous_state or {})
         user_id: str = state.get("user_id") or run.request.user or "default"

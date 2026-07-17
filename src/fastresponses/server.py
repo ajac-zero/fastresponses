@@ -20,7 +20,7 @@ Implements the core Open Responses surface:
 - ``GET /v1/artifacts/{artifact_id}/content`` — download a generated
   artifact.
 - ``DELETE /v1/artifacts/{artifact_id}`` — revoke a generated artifact
-  download ID.
+  download ID (``?delete_content=true`` also deletes the provider bytes).
 """
 
 from __future__ import annotations
@@ -60,11 +60,11 @@ from .models import (
 )
 from .store import InMemoryResponseStore, ResponseStore, StoredResponse
 
+logger = logging.getLogger(__name__)
+
 WS_LOCAL_CACHE_LIMIT = 32
 
 # WebSocket connections are limited to 60 minutes per the specification.
-logger = logging.getLogger(__name__)
-
 WS_CONNECTION_LIMIT_SECONDS = 60 * 60
 
 # HTTP/SSE transport-specific fields that must not be part of a WebSocket
@@ -439,14 +439,20 @@ def create_app(
         )
 
     @app.delete("/v1/artifacts/{artifact_id}")
-    async def delete_artifact(artifact_id: str, request: Request):
+    async def delete_artifact(
+        artifact_id: str, request: Request, delete_content: bool = False
+    ):
         """Revoke a generated artifact download ID.
 
-        Public access is removed before provider cleanup is attempted, so a
-        provider failure can never restore access to a revoked ID. Provider
-        content is deleted only when no other live registry record references
+        By default only public access is removed: generated artifacts are
+        part of the ADK session context (later agent turns may load them),
+        so revoking a download link must not destroy the underlying bytes.
+        With ``?delete_content=true`` the provider content is also deleted,
+        best-effort, and only when no other live registry record references
         the same provider filename, because provider deletion is
-        filename-wide and would otherwise remove unrelated versions.
+        filename-wide and would otherwise remove unrelated versions. Public
+        access is removed before provider cleanup is attempted, so a
+        provider failure can never restore access to a revoked ID.
         """
         await _authorize(request)
         registry = app.state.artifact_registry
@@ -458,7 +464,7 @@ def create_app(
                 code="artifact_not_found",
                 param="artifact_id",
             )
-        if not registry.has_live_reference(record):
+        if delete_content and not registry.has_live_reference(record):
             try:
                 await record.service.delete_artifact(
                     app_name=record.app_name,

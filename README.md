@@ -92,17 +92,22 @@ with zero custom integration.
   ```
 - **Artifact lifecycle**: a download ID stops resolving when it expires, when
   it is evicted by capacity, or when it is explicitly revoked with
-  `DELETE /v1/artifacts/{artifact_id}` (or `ArtifactRegistry.revoke()`); all
-  three return the same non-disclosing `artifact_not_found` error afterwards.
-  Expiration and eviction remove only the public download record and leave
-  provider content in place. Revocation removes public access first and then
-  best-effort deletes the provider content, but only when no other live
+  `DELETE /v1/artifacts/{artifact_id}` (or, programmatically,
+  `await adapter.revoke_artifact(artifact_id)`); all three return the same
+  non-disclosing `artifact_not_found` error afterwards. Expiration, eviction,
+  and plain revocation remove only the public download record and leave
+  provider content in place — generated artifacts are part of the ADK session
+  context, and later agent turns may still load them. Pass
+  `?delete_content=true` (or `delete_content=True` to `revoke_artifact`) to
+  also delete the provider content, which happens only when no other live
   download ID references the same provider filename — provider deletion is
-  filename-wide, so this keeps other registered versions downloadable. A
-  provider cleanup failure never restores public access to a revoked ID.
-  Deleting or cancelling a response does not revoke its artifacts, because
-  artifact items may be replayed into forked or continued conversations;
-  revoke IDs explicitly when they must stop resolving.
+  filename-wide, so this keeps other registered versions downloadable. Public
+  access is always removed before provider cleanup, so a cleanup failure never
+  restores a revoked ID; the endpoint logs cleanup failures best-effort, while
+  `revoke_artifact` raises them so callers can retry. Deleting or cancelling a
+  response does not revoke its artifacts, because artifact items may be
+  replayed into forked or continued conversations; revoke IDs explicitly when
+  they must stop resolving.
 - Generated artifacts (tool-saved or mapper-created) can be constrained with
   size and MIME-type policies. `max_generated_artifact_bytes` caps individual
   artifact size (default: unlimited); `allowed_generated_artifact_mime_types`
