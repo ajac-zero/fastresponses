@@ -28,6 +28,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -62,6 +63,31 @@ WS_CONNECTION_LIMIT_SECONDS = 60 * 60
 # HTTP/SSE transport-specific fields that must not be part of a WebSocket
 # response.create message body.
 _WS_STRIPPED_FIELDS = ("type", "stream", "stream_options", "background")
+
+
+# Characters allowed verbatim inside an RFC 5987 ``ext-value`` (attr-char),
+# minus the characters :func:`urllib.parse.quote` already never encodes.
+_RFC5987_ATTR_CHARS = "!#$&+^`|"
+
+
+def _content_disposition(filename: str) -> str:
+    """Build a forced-download ``Content-Disposition`` header value.
+
+    Emits a sanitized ASCII ``filename`` fallback for legacy clients and,
+    when the original name carries additional (e.g. Unicode) characters, an
+    RFC 5987/6266 ``filename*`` parameter so modern clients preserve the
+    intended international filename. Control characters are dropped and path
+    separators neutralized so filenames can never inject or split headers.
+    """
+    cleaned = "".join(ch for ch in filename if ch.isprintable())
+    cleaned = cleaned.replace("/", "_").replace("\\", "_").strip(" .")
+    ascii_fallback = re.sub(r"[^A-Za-z0-9._ -]", "_", cleaned)
+    ascii_fallback = ascii_fallback.strip(" .") or "artifact"
+    header = f'attachment; filename="{ascii_fallback}"'
+    if cleaned and cleaned != ascii_fallback:
+        encoded = quote(cleaned, safe=_RFC5987_ATTR_CHARS)
+        header += f"; filename*=UTF-8''{encoded}"
+    return header
 
 
 def _event_json(event) -> str:
@@ -395,13 +421,11 @@ def create_app(
         mime_type = blob.mime_type or record.mime_type
         if not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime_type or ""):
             mime_type = "application/octet-stream"
-        safe_filename = re.sub(r"[^A-Za-z0-9._ -]", "_", record.filename)
-        safe_filename = safe_filename.strip(" .") or "artifact"
         return HttpResponse(
             content=blob.data,
             media_type=mime_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                "Content-Disposition": _content_disposition(record.filename),
                 "X-Content-Type-Options": "nosniff",
                 "Cache-Control": "private, no-store",
             },

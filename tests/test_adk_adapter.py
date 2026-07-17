@@ -925,6 +925,35 @@ def test_generated_artifact_non_streaming_and_download():
     assert download.headers["x-content-type-options"] == "nosniff"
 
 
+async def save_unicode_report(tool_context: ToolContext) -> dict:
+    """Save a generated report with an international filename."""
+    version = await tool_context.save_artifact(
+        "compte-rendu — 报告 café.txt",
+        types.Part.from_bytes(data=b"generated report", mime_type="text/plain"),
+    )
+    return {"version": version}
+
+
+def test_generated_artifact_download_preserves_unicode_filename():
+    client, _ = make_adk_client(
+        [call_turn("save_unicode_report", {}), text_turn("Report ready.")],
+        tools=[save_unicode_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = next(
+        item for item in body["output"] if item["type"] == "ajac-zero:artifact"
+    )
+    assert artifact["filename"] == "compte-rendu — 报告 café.txt"
+    download = client.get(artifact["content_url"])
+    assert download.content == b"generated report"
+    assert download.headers["x-content-type-options"] == "nosniff"
+    disposition = download.headers["content-disposition"]
+    assert disposition.startswith('attachment; filename="compte-rendu _ __ caf_.txt"')
+    assert disposition.endswith(
+        "filename*=UTF-8''compte-rendu%20%E2%80%94%20%E6%8A%A5%E5%91%8A%20caf%C3%A9.txt"
+    )
+
+
 def test_inline_input_file_is_not_emitted_as_output_artifact():
     llm = ScriptedLlm(turns=[text_turn("Read it.")], requests=[])
     adapter = ADKAdapter(
