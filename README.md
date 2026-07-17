@@ -109,9 +109,11 @@ with zero custom integration.
   is an allowlist (default `None` = allow all; must be non-empty when set) and
   `blocked_generated_artifact_mime_types` is a denylist (deny wins). Entries
   are matched case-insensitively without parameters and support `type/*`
-  wildcards (e.g. `image/*`). Violations are rejected *before* storage where
-  possible and always before a public download ID is issued, so rejected
-  artifacts are never downloadable. Both streaming and non-streaming
+  wildcards (e.g. `image/*`). Sizes are measured from inline bytes (text
+  parts as UTF-8); file-reference parts carry no local bytes, so only the
+  MIME-type policy applies to them. Violations are rejected *before* storage
+  where possible and always before a public download ID is issued, so
+  rejected artifacts are never downloadable. Both streaming and non-streaming
   responses fail with the stable error codes `artifact_too_large` or
   `artifact_mime_type_rejected` (`invalid_request`, HTTP 400 when
   non-streaming).

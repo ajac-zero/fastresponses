@@ -2020,6 +2020,83 @@ async def test_exposure_gate_never_registers_policy_violating_artifact():
     assert registry._records == {}
 
 
+async def test_exposure_gate_never_registers_mime_violating_artifact():
+    service = InMemoryArtifactService()
+    await service.save_artifact(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        filename="page.html",
+        artifact=types.Part.from_bytes(data=b"<html>", mime_type="text/html"),
+    )
+    registry = ArtifactRegistry()
+    translator = _EventTranslator(
+        set(),
+        {},
+        artifact_service=service,
+        artifact_registry=registry,
+        artifact_policy=_GeneratedArtifactPolicy(
+            blocked_mime_types=frozenset({"text/html"})
+        ),
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        internal_tool_response_mapper=None,
+    )
+
+    with pytest.raises(AdapterError) as err:
+        await translator._artifact_item("page.html", 0)
+
+    assert err.value.code == "artifact_mime_type_rejected"
+    assert err.value.type == "invalid_request"
+    assert registry._records == {}
+
+
+async def save_file_reference(tool_context: ToolContext) -> dict:
+    """Save a generated file-reference artifact."""
+    version = await tool_context.save_artifact(
+        "remote.html",
+        types.Part(
+            file_data=types.FileData(
+                file_uri="gs://bucket/remote.html", mime_type="text/html"
+            )
+        ),
+    )
+    return {"version": version}
+
+
+def test_file_reference_tool_artifact_is_subject_to_mime_policy():
+    client, adapter = _policy_client(
+        [call_turn("save_file_reference", {}), text_turn("Saved.")],
+        tools=[save_file_reference],
+        blocked_generated_artifact_mime_types=["text/html"],
+    )
+    response = client.post("/v1/responses", json={"input": "save it"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_mime_type_rejected"
+    assert all("remote.html" not in key for key in adapter.artifact_service.artifacts)
+    assert adapter.artifact_registry._records == {}
+
+
+def test_file_reference_tool_artifact_is_exempt_from_size_cap():
+    # File references carry no local bytes to measure, so only the MIME
+    # policy applies to them; the size cap must not reject them.
+    client, adapter = _policy_client(
+        [call_turn("save_file_reference", {}), text_turn("Saved.")],
+        tools=[save_file_reference],
+        max_generated_artifact_bytes=1,
+        allowed_generated_artifact_mime_types=["text/html"],
+    )
+    response = client.post("/v1/responses", json={"input": "save it"})
+
+    # The reference is stored, but it exposes no inline bytes, so turning it
+    # into a downloadable artifact item still fails without a registry entry.
+    assert response.json()["error"]["code"] == "artifact_not_found"
+    assert any("remote.html" in key for key in adapter.artifact_service.artifacts)
+    assert adapter.artifact_registry._records == {}
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
