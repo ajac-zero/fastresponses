@@ -1841,10 +1841,7 @@ def test_oversized_tool_artifact_is_rejected_before_storage_and_download():
     assert "report.txt" in error["message"]
     # Nothing was stored and no public download ID was handed out.
     assert adapter.artifact_registry._records == {}
-    keys = adapter.artifact_service.artifacts if hasattr(
-        adapter.artifact_service, "artifacts"
-    ) else {}
-    assert all("report.txt" not in key for key in keys)
+    assert all("report.txt" not in key for key in adapter.artifact_service.artifacts)
 
 
 def test_compliant_tool_artifact_passes_configured_policies():
@@ -1900,6 +1897,64 @@ def test_mime_allowlist_rejects_non_matching_tool_artifact():
     assert adapter.artifact_registry._records == {}
 
 
+async def save_text_notes(tool_context: ToolContext) -> dict:
+    """Save a generated text-part artifact."""
+    version = await tool_context.save_artifact("notes.txt", types.Part(text="x" * 1000))
+    return {"version": version}
+
+
+def test_text_part_tool_artifact_is_subject_to_size_policy():
+    client, adapter = _policy_client(
+        [call_turn("save_text_notes", {}), text_turn("Saved.")],
+        tools=[save_text_notes],
+        max_generated_artifact_bytes=8,
+    )
+    response = client.post("/v1/responses", json={"input": "save notes"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_too_large"
+    # Rejected before storage: the text part was never persisted.
+    assert all("notes.txt" not in key for key in adapter.artifact_service.artifacts)
+    assert adapter.artifact_registry._records == {}
+
+
+def test_text_part_tool_artifact_is_subject_to_mime_policy():
+    client, adapter = _policy_client(
+        [call_turn("save_text_notes", {}), text_turn("Saved.")],
+        tools=[save_text_notes],
+        blocked_generated_artifact_mime_types=["text/*"],
+    )
+    response = client.post("/v1/responses", json={"input": "save notes"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_mime_type_rejected"
+    assert all("notes.txt" not in key for key in adapter.artifact_service.artifacts)
+    assert adapter.artifact_registry._records == {}
+
+
+def test_mapper_created_artifact_policy_rejection_non_streaming():
+    async def mapper(response: ADKToolResponse):
+        return [await response.create_artifact("summary.bin", b"0" * 32, "text/plain")]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+        max_generated_artifact_bytes=16,
+    )
+    client = TestClient(create_app(adapter))
+    response = client.post("/v1/responses", json={"input": "weather?"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "artifact_too_large"
+    assert adapter.artifact_registry._records == {}
+    assert all("summary.bin" not in key for key in adapter.artifact_service.artifacts)
+
+
 def test_mapper_created_artifact_policy_rejection_keeps_canonical_pair():
     async def mapper(response: ADKToolResponse):
         return [await response.create_artifact("summary.bin", b"0" * 32, "text/plain")]
@@ -1930,10 +1985,7 @@ def test_mapper_created_artifact_policy_rejection_keeps_canonical_pair():
     assert payloads[-1]["response"]["error"]["code"] == "artifact_too_large"
     # Rejected before storage: no artifact bytes and no download ID exist.
     assert adapter.artifact_registry._records == {}
-    keys = adapter.artifact_service.artifacts if hasattr(
-        adapter.artifact_service, "artifacts"
-    ) else {}
-    assert all("summary.bin" not in key for key in keys)
+    assert all("summary.bin" not in key for key in adapter.artifact_service.artifacts)
 
 
 async def test_exposure_gate_never_registers_policy_violating_artifact():

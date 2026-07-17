@@ -270,13 +270,29 @@ class _GeneratedArtifactService(BaseArtifactService):
         self.policy = policy
 
     async def save_artifact(self, **kwargs):
-        _validate_generated_artifact_name(kwargs["filename"])
-        blob = getattr(kwargs.get("artifact"), "inline_data", None)
+        filename = kwargs["filename"]
+        _validate_generated_artifact_name(filename)
+        artifact = kwargs.get("artifact")
+        blob = getattr(artifact, "inline_data", None)
+        text = getattr(artifact, "text", None)
+        file_data = getattr(artifact, "file_data", None)
         if blob is not None and blob.data is not None:
             self.policy.check(
-                kwargs["filename"],
-                len(blob.data),
-                blob.mime_type or _guess_mime(kwargs["filename"]),
+                filename, len(blob.data), blob.mime_type or _guess_mime(filename)
+            )
+        elif text is not None:
+            self.policy.check(
+                filename,
+                len(text.encode("utf-8")),
+                _guess_mime(filename, "text/plain"),
+            )
+        elif file_data is not None:
+            # A file reference carries no local bytes to measure, but its
+            # declared MIME type is still subject to the policy.
+            self.policy.check(
+                filename,
+                0,
+                file_data.mime_type or _guess_mime(filename),
             )
         return await self.service.save_artifact(**kwargs)
 
