@@ -156,6 +156,37 @@ def _refresh_artifact_items(
     return response.model_copy(update={"output": output}) if changed else response
 
 
+async def _refresh_response_events(
+    events: AsyncIterator, registry: ArtifactRegistry | None
+) -> AsyncIterator:
+    """Apply live artifact-availability refresh to any event carrying a full
+    ``Response`` snapshot (``response.created``, ``.in_progress``,
+    ``.completed``, ``.incomplete``, ``.failed``).
+
+    A live (non-background) stream is generated and delivered in a single
+    pass, so without this a same-turn registry eviction — another artifact
+    generated later in the same turn pushing an earlier one out once
+    ``max_records`` is exceeded — could let the terminal event advertise an
+    artifact as ``available: true`` moments before its link actually stops
+    resolving. This mirrors ``GET``/``cancel`` treatment of stored responses
+    for the one response snapshot a non-background stream ever produces.
+    Background streaming is unaffected: its buffered/replayed events are
+    intentionally a frozen, point-in-time record (see
+    ``GET /v1/responses/{id}/events``).
+    """
+    if registry is None:
+        async for event in events:
+            yield event
+        return
+    async for event in events:
+        response = getattr(event, "response", None)
+        if isinstance(response, Response):
+            refreshed = _refresh_artifact_items(response, registry)
+            if refreshed is not response:
+                event = event.model_copy(update={"response": refreshed})
+        yield event
+
+
 def _event_json(event) -> str:
     """Serialize a streaming event, omitting the obfuscation key when unset."""
     data = event.model_dump()
@@ -414,7 +445,11 @@ def create_app(
 
         if payload.stream:
             return StreamingResponse(
-                _sse(engine.events(run)),
+                _sse(
+                    _refresh_response_events(
+                        engine.events(run), app.state.artifact_registry
+                    )
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -428,6 +463,7 @@ def create_app(
                 code=response.error.code,
                 param=getattr(response.error, "param", None),
             )
+        response = _refresh_artifact_items(response, app.state.artifact_registry)
         return JSONResponse(content=response.model_dump(exclude_none=False))
 
     @app.post("/v1/responses/compact")
@@ -726,7 +762,10 @@ def create_app(
             stored_holder.append(stored)
 
         failed = False
-        async for event in engine.events(run, on_stored=on_stored):
+        events = _refresh_response_events(
+            engine.events(run, on_stored=on_stored), app.state.artifact_registry
+        )
+        async for event in events:
             if isinstance(event, ErrorEvent):
                 # WebSocket failures are sent as a single error envelope
                 # instead of the SSE error + response.failed pair.

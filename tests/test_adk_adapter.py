@@ -1479,11 +1479,42 @@ def test_get_response_reports_evicted_artifact_as_unavailable():
     assert first["id"] != second["id"]
 
     # max_records=1 evicted the first record as soon as the second was
-    # registered, before the response was ever fetched.
+    # registered, within the same turn and before the response was ever
+    # returned to the client — the immediate creation response must not
+    # advertise it as available.
+    assert first["available"] is False
+    assert second["available"] is True
+
     refetched = client.get(f"/v1/responses/{body['id']}").json()
     refreshed_first, refreshed_second = _generated_artifacts(refetched)
     assert refreshed_first["available"] is False
-    assert refreshed_second["available"] is True
+
+
+def test_streaming_response_completed_event_reports_evicted_artifact():
+    registry = ArtifactRegistry(max_records=1, ttl_seconds=3600)
+    client, _ = _make_artifact_adapter(
+        [
+            call_turn("save_report", {}),
+            call_turn("save_report", {}),
+            text_turn("Two reports saved."),
+        ],
+        tools=[save_report],
+        adapter_kwargs={"artifact_registry": registry},
+    )
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"input": "make two reports", "stream": True},
+    ) as r:
+        events = [e for e in read_sse(r) if isinstance(e, dict)]
+
+    final = next(e for e in events if e["type"] == "response.completed")
+    first, second = _generated_artifacts(final["response"])
+    # Same same-turn eviction as the non-streaming case, but observed via
+    # the terminal SSE event's embedded response snapshot instead of a
+    # follow-up GET.
+    assert first["available"] is False
+    assert second["available"] is True
 
 
 def test_get_response_refreshes_and_expires_artifact_availability(monkeypatch):
