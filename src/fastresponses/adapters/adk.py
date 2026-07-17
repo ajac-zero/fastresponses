@@ -25,6 +25,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import re
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -192,14 +193,107 @@ class ADKArtifactInputFileStore:
         ) + "]"
 
 
+class _ArtifactPolicyViolation(ValueError):
+    """A generated artifact violates the configured size or MIME-type policy.
+
+    ADK surfaces unhandled tool exceptions as error events carrying only the
+    exception class name, so each stable policy-rejection code gets its own
+    subclass and the code is a class attribute.
+    """
+
+    code = "artifact_policy_violation"
+
+
+class _ArtifactTooLargeError(_ArtifactPolicyViolation):
+    code = "artifact_too_large"
+
+
+class _ArtifactMimeTypeRejectedError(_ArtifactPolicyViolation):
+    code = "artifact_mime_type_rejected"
+
+
+_ARTIFACT_POLICY_VIOLATIONS: dict[str, type[_ArtifactPolicyViolation]] = {
+    cls.__name__: cls
+    for cls in (_ArtifactTooLargeError, _ArtifactMimeTypeRejectedError)
+}
+
+
+_MIME_POLICY_PATTERN = re.compile(r"[\w.+-]+/(?:\*|[\w.+-]+)")
+
+
+def _normalize_mime_policy(values: Iterable[str], param: str) -> frozenset[str]:
+    normalized: set[str] = set()
+    for value in values:
+        entry = value.strip().lower()
+        if not _MIME_POLICY_PATTERN.fullmatch(entry):
+            raise ValueError(f"{param} contains an invalid MIME type: {value!r}.")
+        normalized.add(entry)
+    return frozenset(normalized)
+
+
+@dataclass(frozen=True)
+class _GeneratedArtifactPolicy:
+    """Size and MIME-type policy applied to generated artifacts."""
+
+    max_bytes: int | None = None
+    allowed_mime_types: frozenset[str] | None = None
+    blocked_mime_types: frozenset[str] = frozenset()
+
+    def check(self, filename: str, size: int, mime_type: str | None) -> None:
+        if self.max_bytes is not None and size > self.max_bytes:
+            raise _ArtifactTooLargeError(
+                f"Generated artifact {filename!r} is {size} bytes, which exceeds "
+                f"the configured maximum of {self.max_bytes} bytes."
+            )
+        mime = (mime_type or "").split(";", 1)[0].strip().lower()
+        candidates = {mime}
+        if "/" in mime:
+            candidates.add(f"{mime.split('/', 1)[0]}/*")
+        if candidates & self.blocked_mime_types or (
+            self.allowed_mime_types is not None
+            and not candidates & self.allowed_mime_types
+        ):
+            raise _ArtifactMimeTypeRejectedError(
+                f"Generated artifact {filename!r} has MIME type "
+                f"{mime or 'unknown'!r}, which is not permitted by the "
+                "configured artifact MIME-type policy."
+            )
+
+
 class _GeneratedArtifactService(BaseArtifactService):
     """Prevent agent tools from mutating adapter-owned input artifacts."""
 
-    def __init__(self, service: BaseArtifactService) -> None:
+    def __init__(
+        self, service: BaseArtifactService, policy: _GeneratedArtifactPolicy
+    ) -> None:
         self.service = service
+        self.policy = policy
 
     async def save_artifact(self, **kwargs):
-        _validate_generated_artifact_name(kwargs["filename"])
+        filename = kwargs["filename"]
+        _validate_generated_artifact_name(filename)
+        artifact = kwargs.get("artifact")
+        blob = getattr(artifact, "inline_data", None)
+        text = getattr(artifact, "text", None)
+        file_data = getattr(artifact, "file_data", None)
+        if blob is not None and blob.data is not None:
+            self.policy.check(
+                filename, len(blob.data), blob.mime_type or _guess_mime(filename)
+            )
+        elif text is not None:
+            self.policy.check(
+                filename,
+                len(text.encode("utf-8")),
+                _guess_mime(filename, "text/plain"),
+            )
+        elif file_data is not None:
+            # A file reference carries no local bytes to measure, but its
+            # declared MIME type is still subject to the policy.
+            self.policy.check(
+                filename,
+                0,
+                file_data.mime_type or _guess_mime(filename),
+            )
         return await self.service.save_artifact(**kwargs)
 
     async def load_artifact(self, **kwargs):
@@ -481,6 +575,9 @@ class ADKAdapter(AgentAdapter):
         artifact_registry: ArtifactRegistry | None = None,
         artifact_registry_max_records: int | None = None,
         artifact_registry_ttl_seconds: float | None = None,
+        max_generated_artifact_bytes: int | None = None,
+        allowed_generated_artifact_mime_types: Iterable[str] | None = None,
+        blocked_generated_artifact_mime_types: Iterable[str] = (),
     ) -> None:
         if input_file_routes is not None and input_file_router is not None:
             raise ValueError("Configure input_file_routes or input_file_router, not both.")
@@ -491,6 +588,31 @@ class ADKAdapter(AgentAdapter):
                 "Configure artifact_registry or artifact_registry_max_records/"
                 "artifact_registry_ttl_seconds, not both."
             )
+        if max_generated_artifact_bytes is not None and not (
+            max_generated_artifact_bytes > 0
+        ):
+            raise ValueError(
+                "max_generated_artifact_bytes must be a positive integer."
+            )
+        allowed_mime_types: frozenset[str] | None = None
+        if allowed_generated_artifact_mime_types is not None:
+            allowed_mime_types = _normalize_mime_policy(
+                allowed_generated_artifact_mime_types,
+                "allowed_generated_artifact_mime_types",
+            )
+            if not allowed_mime_types:
+                raise ValueError(
+                    "allowed_generated_artifact_mime_types must not be empty; "
+                    "pass None to allow all MIME types."
+                )
+        self.generated_artifact_policy = _GeneratedArtifactPolicy(
+            max_bytes=max_generated_artifact_bytes,
+            allowed_mime_types=allowed_mime_types,
+            blocked_mime_types=_normalize_mime_policy(
+                blocked_generated_artifact_mime_types,
+                "blocked_generated_artifact_mime_types",
+            ),
+        )
         self._validate_input_file_action(default_input_file_action)
         self.agent = agent
         self.app_name = app_name
@@ -695,7 +817,9 @@ class ADKAdapter(AgentAdapter):
             agent=agent,
             app_name=self.app_name,
             session_service=self.session_service,
-            artifact_service=_GeneratedArtifactService(self.artifact_service),
+            artifact_service=_GeneratedArtifactService(
+                self.artifact_service, self.generated_artifact_policy
+            ),
         )
 
         client_tool_names = {t.name for t in client_tools}
@@ -704,6 +828,7 @@ class ADKAdapter(AgentAdapter):
             call_map,
             artifact_service=self.artifact_service,
             artifact_registry=self.artifact_registry,
+            artifact_policy=self.generated_artifact_policy,
             app_name=self.app_name,
             user_id=user_id,
             session_id=session.id,
@@ -730,6 +855,10 @@ class ADKAdapter(AgentAdapter):
                 translator.raise_deferred_error()
         except AdapterError:
             raise
+        except _ArtifactPolicyViolation as exc:
+            raise AdapterError(
+                str(exc), type="invalid_request", code=exc.code
+            ) from exc
         except ValueError as exc:
             raise AdapterError(str(exc), type="invalid_request", code="invalid_value")
         except Exception as exc:
@@ -1278,6 +1407,7 @@ class _EventTranslator:
         *,
         artifact_service: BaseArtifactService,
         artifact_registry: ArtifactRegistry,
+        artifact_policy: _GeneratedArtifactPolicy,
         app_name: str,
         user_id: str,
         session_id: str,
@@ -1287,6 +1417,7 @@ class _EventTranslator:
         self.call_map = call_map
         self.artifact_service = artifact_service
         self.artifact_registry = artifact_registry
+        self.artifact_policy = artifact_policy
         self.app_name = app_name
         self.user_id = user_id
         self.session_id = session_id
@@ -1298,6 +1429,17 @@ class _EventTranslator:
 
     async def translate(self, event: Event) -> list[AdapterEvent]:
         if event.error_code or event.error_message:
+            # ADK surfaces unhandled tool exceptions as error events that only
+            # carry the exception class name; map policy violations back to
+            # their stable rejection codes.
+            violation = _ARTIFACT_POLICY_VIOLATIONS.get(event.error_code or "")
+            if violation is not None:
+                raise AdapterError(
+                    event.error_message
+                    or "Generated artifact violates the configured policy.",
+                    type="invalid_request",
+                    code=violation.code,
+                )
             raise AdapterError(
                 event.error_message or f"ADK error: {event.error_code}",
                 type="model_error",
@@ -1368,6 +1510,11 @@ class _EventTranslator:
                     if isinstance(mapped, Awaitable):
                         mapped = await mapped
                     out.extend(ItemDone(item) for item in mapped)
+                except _ArtifactPolicyViolation as exc:
+                    self._deferred_error = AdapterError(
+                        str(exc), type="invalid_request", code=exc.code
+                    )
+                    self._deferred_error.__cause__ = exc
                 except Exception as exc:
                     self._deferred_error = AdapterError(
                         "Internal tool response mapper failed.",
@@ -1481,6 +1628,9 @@ class _EventTranslator:
         self, filename: str, data: bytes, mime_type: str, call_id: str | None = None
     ) -> Item:
         _validate_generated_artifact_name(filename)
+        self.artifact_policy.check(
+            filename, len(data), mime_type or _guess_mime(filename)
+        )
         version = await self.artifact_service.save_artifact(
             app_name=self.app_name,
             user_id=self.user_id,
@@ -1507,6 +1657,15 @@ class _EventTranslator:
                 code="artifact_not_found",
             )
         mime_type = blob.mime_type or _guess_mime(filename)
+        try:
+            # Defense in depth: never hand out a public download ID for an
+            # artifact that violates the configured policy, regardless of how
+            # it reached the artifact service.
+            self.artifact_policy.check(filename, len(blob.data), mime_type)
+        except _ArtifactPolicyViolation as exc:
+            raise AdapterError(
+                str(exc), type="invalid_request", code=exc.code
+            ) from exc
         artifact_id = self.artifact_registry.register(
             ArtifactRecord(
                 service=self.artifact_service,

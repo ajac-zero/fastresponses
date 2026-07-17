@@ -103,6 +103,28 @@ with zero custom integration.
   Deleting or cancelling a response does not revoke its artifacts, because
   artifact items may be replayed into forked or continued conversations;
   revoke IDs explicitly when they must stop resolving.
+- Generated artifacts (tool-saved or mapper-created) can be constrained with
+  size and MIME-type policies. `max_generated_artifact_bytes` caps individual
+  artifact size (default: unlimited); `allowed_generated_artifact_mime_types`
+  is an allowlist (default `None` = allow all; must be non-empty when set) and
+  `blocked_generated_artifact_mime_types` is a denylist (deny wins). Entries
+  are matched case-insensitively without parameters and support `type/*`
+  wildcards (e.g. `image/*`). Sizes are measured from inline bytes (text
+  parts as UTF-8); file-reference parts carry no local bytes, so only the
+  MIME-type policy applies to them. Violations are rejected *before* storage
+  where possible and always before a public download ID is issued, so
+  rejected artifacts are never downloadable. Both streaming and non-streaming
+  responses fail with the stable error codes `artifact_too_large` or
+  `artifact_mime_type_rejected` (`invalid_request`, HTTP 400 when
+  non-streaming).
+
+  ```python
+  adapter = ADKAdapter(
+      agent,
+      max_generated_artifact_bytes=8 * 1024 * 1024,
+      allowed_generated_artifact_mime_types=["application/pdf", "image/*", "text/plain"],
+  )
+  ```
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
