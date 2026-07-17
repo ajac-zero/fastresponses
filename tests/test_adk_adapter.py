@@ -1517,6 +1517,36 @@ def test_streaming_response_completed_event_reports_evicted_artifact():
     assert second["available"] is True
 
 
+def test_websocket_response_completed_reports_evicted_artifact():
+    registry = ArtifactRegistry(max_records=1, ttl_seconds=3600)
+    client, _ = _make_artifact_adapter(
+        [
+            call_turn("save_report", {}),
+            call_turn("save_report", {}),
+            text_turn("Two reports saved."),
+        ],
+        tools=[save_report],
+        adapter_kwargs={"artifact_registry": registry},
+    )
+    with client.websocket_connect("/v1/responses") as ws:
+        ws.send_json({"type": "response.create", "input": "make two reports"})
+        final = None
+        while final is None:
+            event = ws.receive_json()
+            if event["type"] in (
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            ):
+                final = event["response"]
+
+    # Same same-turn eviction as the non-streaming/SSE cases, but observed
+    # via the terminal event on the WebSocket transport.
+    first, second = _generated_artifacts(final)
+    assert first["available"] is False
+    assert second["available"] is True
+
+
 def test_get_response_refreshes_and_expires_artifact_availability(monkeypatch):
     now = {"value": 1_000.0}
     monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
