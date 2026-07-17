@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from unittest.mock import patch
@@ -925,6 +926,9 @@ def test_generated_artifact_non_streaming_and_download():
     assert artifact["filename"] == "report.txt"
     assert artifact["mime_type"] == "text/plain"
     assert artifact["size"] == len(b"generated report")
+    assert artifact["available"] is True
+    assert isinstance(artifact["expires_at"], int)
+    assert artifact["expires_at"] > time.time()
     download = client.get(artifact["content_url"])
     assert download.content == b"generated report"
     assert download.headers["x-content-type-options"] == "nosniff"
@@ -959,10 +963,10 @@ def test_generated_artifact_download_preserves_unicode_filename():
     )
 
 
-def _make_artifact_adapter(turns, **agent_kwargs):
+def _make_artifact_adapter(turns, *, adapter_kwargs=None, **agent_kwargs):
     llm = ScriptedLlm(turns=list(turns), requests=[])
     agent = Agent(name="test_agent", model=llm, instruction="Be helpful.", **agent_kwargs)
-    adapter = ADKAdapter(agent, app_name="test-app")
+    adapter = ADKAdapter(agent, app_name="test-app", **(adapter_kwargs or {}))
     return TestClient(create_app(adapter)), adapter
 
 
@@ -1349,6 +1353,77 @@ def test_deleting_response_does_not_revoke_artifacts():
     download = client.get(artifact["content_url"])
     assert download.status_code == 200
     assert download.content == b"generated report"
+
+
+def test_get_response_reports_revoked_artifact_as_unavailable():
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+    assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+
+    refetched = client.get(f"/v1/responses/{body['id']}").json()
+    refreshed = _generated_artifacts(refetched)[0]
+    assert refreshed["available"] is False
+    # Revoking never mutates unrelated fields of the item.
+    assert refreshed["filename"] == artifact["filename"]
+    assert refreshed["content_url"] == artifact["content_url"]
+
+
+def test_get_response_reports_evicted_artifact_as_unavailable():
+    registry = ArtifactRegistry(max_records=1, ttl_seconds=3600)
+    client, _ = _make_artifact_adapter(
+        [
+            call_turn("save_report", {}),
+            call_turn("save_report", {}),
+            text_turn("Two reports saved."),
+        ],
+        tools=[save_report],
+        adapter_kwargs={"artifact_registry": registry},
+    )
+    body = client.post("/v1/responses", json={"input": "make two reports"}).json()
+    first, second = _generated_artifacts(body)
+    assert first["id"] != second["id"]
+
+    # max_records=1 evicted the first record as soon as the second was
+    # registered, before the response was ever fetched.
+    refetched = client.get(f"/v1/responses/{body['id']}").json()
+    refreshed_first, refreshed_second = _generated_artifacts(refetched)
+    assert refreshed_first["available"] is False
+    assert refreshed_second["available"] is True
+
+
+def test_get_response_refreshes_and_expires_artifact_availability(monkeypatch):
+    now = {"value": 1_000.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    monkeypatch.setattr("fastresponses.artifacts.time.time", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=8, ttl_seconds=10)
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        adapter_kwargs={"artifact_registry": registry},
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+    assert artifact["expires_at"] == 1_010
+
+    # Retrieving the response before expiry is a live access: it slides the
+    # download window forward instead of letting a fixed clock run out.
+    now["value"] = 1_009.0
+    refetched = client.get(f"/v1/responses/{body['id']}").json()
+    refreshed = _generated_artifacts(refetched)[0]
+    assert refreshed["available"] is True
+    assert refreshed["expires_at"] == 1_019
+    assert client.get(artifact["content_url"]).status_code == 200
+
+    # Without another access before the (now later) expiry, the link dies.
+    now["value"] = 1_020.0
+    refetched = client.get(f"/v1/responses/{body['id']}").json()
+    refreshed = _generated_artifacts(refetched)[0]
+    assert refreshed["available"] is False
+    assert client.get(artifact["content_url"]).status_code == 404
 
 
 def test_inline_input_file_is_not_emitted_as_output_artifact():
@@ -1954,6 +2029,37 @@ def test_artifact_registry_is_bounded_and_expires(monkeypatch):
     assert registry.get(second) is record
     now["value"] = 11
     assert registry.get(second) is None
+
+
+def test_artifact_registry_refresh_slides_expiry_without_changing_id(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    record = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    artifact_id = registry.register(record)
+
+    now["value"] = 9
+    assert registry.refresh(artifact_id) is record
+    # Without the refresh this would have expired at t=10.
+    now["value"] = 11
+    assert registry.get(artifact_id) is record
+
+    now["value"] = 22
+    assert registry.refresh(artifact_id) is None
+
+
+def test_artifact_registry_refresh_treats_expired_and_unknown_ids_as_none(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    record = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    artifact_id = registry.register(record)
+
+    now["value"] = 11
+    assert registry.refresh(artifact_id) is None
+    assert registry.refresh("artifact_unknown") is None
+    # The expired entry was self-healed (removed) by the failed refresh.
+    assert registry.get(artifact_id) is None
 
 
 def test_artifact_registry_revoke_removes_only_the_target_record(monkeypatch):

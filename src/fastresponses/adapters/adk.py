@@ -26,6 +26,7 @@ import base64
 import json
 import mimetypes
 import re
+import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -56,7 +57,7 @@ from ..adapter import (  # noqa: I001
     TextDelta,
     UsageDelta,
 )
-from ..artifacts import ArtifactRecord, ArtifactRegistry
+from ..artifacts import ARTIFACT_TYPE, ArtifactRecord, ArtifactRegistry
 from ..compaction import expand_compaction_item
 from ..models import (
     CompactionItem,
@@ -76,8 +77,6 @@ from ..models import (
     new_call_id,
     new_function_call_id,
 )
-
-ARTIFACT_TYPE = "ajac-zero:artifact"
 
 
 @dataclass(frozen=True)
@@ -1746,6 +1745,8 @@ class _EventTranslator:
                     "mime_type": mime_type,
                     "size": len(blob.data),
                     "content_url": f"/v1/artifacts/{artifact_id}/content",
+                    "available": True,
+                    "expires_at": int(time.time() + self.artifact_registry.ttl_seconds),
                     **({"call_id": call_id} if call_id else {}),
                 }
             )

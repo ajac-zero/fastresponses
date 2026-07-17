@@ -133,6 +133,21 @@ with zero custom integration.
       allowed_generated_artifact_mime_types=["application/pdf", "image/*", "text/plain"],
   )
   ```
+- **Artifact expiration is surfaced, not silent**: every `ajac-zero:artifact`
+  item carries `expires_at` (Unix seconds, set when the item is created) and
+  `available` (whether the download link is currently expected to work).
+  `GET /v1/responses/{id}` recomputes both fields on every call against the
+  live registry, so a stored response never keeps advertising a dead link
+  without saying so. Retrieving a response is itself a live access: while a
+  registered artifact is still live, `GET` extends its download window to a
+  fresh full TTL from that moment (sliding expiration) and advances
+  `expires_at` to match; once an artifact has expired, been evicted, or been
+  revoked, `available` flips to `false` and `content_url` returns
+  `artifact_not_found` like any other dead ID. Response retention (how long
+  the response object stays in the response store) and artifact retention
+  (how long its download link keeps working) are independent: a response can
+  outlive its artifacts, and `store: false` responses are never persisted
+  regardless of artifact liveness.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached

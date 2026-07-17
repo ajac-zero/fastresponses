@@ -41,11 +41,13 @@ from fastapi.responses import JSONResponse, Response as HttpResponse, StreamingR
 from pydantic import ValidationError
 
 from .adapter import AgentAdapter, AgentRun
+from .artifacts import ARTIFACT_TYPE, ArtifactRegistry
 from .compaction import compact_items
 from .engine import ResponseEngine, collect_response
 from .models import (
     ERROR_STATUS_CODES,
     CompactResource,
+    CustomItem,
     ErrorBody,
     ErrorEnvelope,
     ErrorEvent,
@@ -95,6 +97,47 @@ def _content_disposition(filename: str) -> str:
         encoded = quote(cleaned, safe=_RFC5987_ATTR_CHARS)
         header += f"; filename*=UTF-8''{encoded}"
     return header
+
+
+def _refresh_artifact_items(
+    response: Response, registry: ArtifactRegistry | None
+) -> Response:
+    """Report current download availability on ``ajac-zero:artifact`` items.
+
+    Retrieving a stored response is a live access, so still-registered
+    artifacts have their download window extended (sliding TTL) and their
+    ``expires_at`` advanced accordingly. Artifacts that are no longer
+    registered — expired, evicted by capacity, or explicitly revoked — are
+    reported with ``available: False`` rather than silently continuing to
+    advertise a dead ``content_url``. The registry is the sole source of
+    truth for availability and is never itself persisted, so this is
+    recomputed fresh on every retrieval; response retention (how long the
+    response object itself is stored) and artifact retention (how long its
+    download link keeps working) are independent guarantees.
+    """
+    if registry is None:
+        return response
+    output: list[Item] = []
+    changed = False
+    for item in response.output:
+        if (
+            isinstance(item, CustomItem)
+            and item.type == ARTIFACT_TYPE
+            and isinstance(item.id, str)
+        ):
+            record = registry.refresh(item.id)
+            update = (
+                {
+                    "available": True,
+                    "expires_at": int(time.time() + registry.ttl_seconds),
+                }
+                if record is not None
+                else {"available": False}
+            )
+            item = item.model_copy(update=update)
+            changed = True
+        output.append(item)
+    return response.model_copy(update={"output": output}) if changed else response
 
 
 def _event_json(event) -> str:
@@ -396,7 +439,8 @@ def create_app(
                 code="response_not_found",
                 param="response_id",
             )
-        return JSONResponse(content=stored.response.model_dump())
+        response = _refresh_artifact_items(stored.response, app.state.artifact_registry)
+        return JSONResponse(content=response.model_dump())
 
     @app.get("/v1/artifacts/{artifact_id}/content")
     async def get_artifact_content(artifact_id: str, request: Request):
