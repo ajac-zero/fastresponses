@@ -76,6 +76,20 @@ with zero custom integration.
 - Pass an `internal_tool_response_mapper` to `ADKAdapter` to derive additional
   namespaced items from completed internal tools. Mappers may create downloadable
   `ajac-zero:artifact` items backed by the authenticated artifact endpoint.
+- Generated artifact download links are tracked in an in-process
+  `ArtifactRegistry`, defaulting to a 3,600 second TTL and 1,024-record
+  capacity. Tune these with `artifact_registry_ttl_seconds` /
+  `artifact_registry_max_records`, or inject a pre-built instance (e.g. a
+  shared implementation) via `artifact_registry=`. Both values must be
+  positive; configure the registry or the two size/TTL kwargs, not both.
+
+  ```python
+  adapter = ADKAdapter(
+      agent,
+      artifact_registry_ttl_seconds=900,
+      artifact_registry_max_records=256,
+  )
+  ```
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached
@@ -410,9 +424,13 @@ pass for both adapters, covering both HTTP and WebSocket transports.
 - Background event buffers (for `GET /v1/responses/{id}/events` resumption)
   are in-process and bounded to the 64 most recent background runs.
 - Generated artifact download IDs are process-local, retained for one hour, and
-  bounded to the 1,024 most recently used records. Restarts and requests routed
-  to another worker invalidate those URLs; multi-worker deployments need sticky
-  routing or a shared registry implementation.
+  bounded to the 1,024 most recently used records by default. Restarts and
+  requests routed to another worker invalidate those URLs; multi-worker
+  deployments need sticky routing or a shared registry implementation. The
+  retention window and capacity are configurable via `ADKAdapter`'s
+  `artifact_registry_ttl_seconds` / `artifact_registry_max_records`, or by
+  passing a pre-built `artifact_registry=ArtifactRegistry(...)` (e.g. a shared
+  or differently tuned instance).
 - `include: ["message.output_text.logprobs"]` is accepted but logprob arrays
   stay empty (ADK does not surface per-token logprobs in its event stream; the
   request maps to `response_logprobs` on the model call).
