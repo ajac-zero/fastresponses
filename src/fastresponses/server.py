@@ -104,16 +104,32 @@ def _refresh_artifact_items(
 ) -> Response:
     """Report current download availability on ``ajac-zero:artifact`` items.
 
-    Retrieving a stored response is a live access, so still-registered
-    artifacts have their download window extended (sliding TTL) and their
-    ``expires_at`` advanced accordingly. Artifacts that are no longer
-    registered — expired, evicted by capacity, or explicitly revoked — are
-    reported with ``available: False`` rather than silently continuing to
-    advertise a dead ``content_url``. The registry is the sole source of
+    Used by every endpoint that returns a full, current snapshot of a stored
+    response (``GET /v1/responses/{id}`` and ``POST
+    /v1/responses/{id}/cancel``) so their artifact availability semantics
+    stay aligned. Retrieving a stored response this way is a live access, so
+    still-registered artifacts have their download window extended (sliding
+    TTL) and their ``expires_at`` advanced accordingly. Artifacts that are no
+    longer registered — expired, evicted by capacity, or explicitly revoked
+    — are reported with ``available: False`` rather than silently continuing
+    to advertise a dead ``content_url``. The registry is the sole source of
     truth for availability and is never itself persisted, so this is
     recomputed fresh on every retrieval; response retention (how long the
     response object itself is stored) and artifact retention (how long its
     download link keeps working) are independent guarantees.
+
+    ``expires_at`` is advisory: it is derived from a wall-clock read
+    (``time.time()``) taken alongside the registry's internal monotonic
+    deadline, so it approximates rather than guarantees the exact instant a
+    link stops resolving. ``available`` (recomputed from the registry on
+    every call) is the authoritative signal.
+
+    This does not apply to ``GET /v1/responses/{id}/events``: that endpoint
+    replays a historical, pre-framed event log for resumable streaming, so
+    an artifact item's fields there reflect its availability at the moment
+    the event was recorded, not at replay time. Call
+    ``GET /v1/responses/{id}`` for the current, live availability of a
+    response's artifacts.
     """
     if registry is None:
         return response
@@ -574,14 +590,22 @@ def create_app(
             except asyncio.CancelledError:
                 pass
             stored = await response_store.get(response_id) or stored
-        return JSONResponse(content=stored.response.model_dump())
+        response = _refresh_artifact_items(stored.response, app.state.artifact_registry)
+        return JSONResponse(content=response.model_dump())
 
     @app.get("/v1/responses/{response_id}/events")
     async def stream_response_events(
         response_id: str, request: Request, starting_after: int = -1
     ):
         """Resume the event stream of a background response from a cursor
-        (``starting_after`` is the last ``sequence_number`` received)."""
+        (``starting_after`` is the last ``sequence_number`` received).
+
+        Replayed events are pre-framed at the moment they were recorded, so
+        any ``ajac-zero:artifact`` item's ``available``/``expires_at``
+        fields reflect its availability at recording time, not at replay
+        time. Use ``GET /v1/responses/{response_id}`` for current artifact
+        availability.
+        """
         await _authorize(request)
         bg: _BackgroundRun | None = app.state.background_runs.get(response_id)
         if bg is None:

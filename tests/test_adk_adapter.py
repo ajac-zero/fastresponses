@@ -1372,6 +1372,39 @@ def test_get_response_reports_revoked_artifact_as_unavailable():
     assert refreshed["content_url"] == artifact["content_url"]
 
 
+def _wait_for_status(client, response_id, statuses, timeout=5.0):
+    deadline = time.time() + timeout
+    body = None
+    while time.time() < deadline:
+        body = client.get(f"/v1/responses/{response_id}").json()
+        if body["status"] in statuses:
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"response never reached {statuses}: {body}")
+
+
+def test_cancel_response_reports_revoked_artifact_as_unavailable():
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    with client:
+        queued = client.post(
+            "/v1/responses", json={"input": "make a report", "background": True}
+        ).json()
+        body = _wait_for_status(client, queued["id"], {"completed"})
+        artifact = _generated_artifacts(body)[0]
+        assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+
+        # POST .../cancel returns a full response snapshot too, so it must
+        # reflect the same live artifact availability as GET, not the stale
+        # creation-time values.
+        cancelled = client.post(f"/v1/responses/{body['id']}/cancel").json()
+        assert cancelled["status"] == "completed"
+        refreshed = _generated_artifacts(cancelled)[0]
+        assert refreshed["available"] is False
+
+
 def test_get_response_reports_evicted_artifact_as_unavailable():
     registry = ArtifactRegistry(max_records=1, ttl_seconds=3600)
     client, _ = _make_artifact_adapter(
