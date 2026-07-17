@@ -1659,6 +1659,49 @@ def test_mapper_created_artifact_matches_documented_schema_and_carries_call_id()
     assert artifact.size == len(b"weather summary")
 
 
+def test_streaming_mapper_created_artifact_matches_documented_ordering():
+    """Backs the README "Item ordering examples" streaming case: the
+    artifact's response.output_item.done event lands immediately after the
+    function_call/function_call_output pair that produced it, and carries
+    that pair's call_id."""
+
+    async def mapper(response: ADKToolResponse):
+        return [
+            await response.create_artifact("summary.txt", b"weather summary", "text/plain")
+        ]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+    )
+    client = TestClient(create_app(adapter))
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "weather?", "stream": True}
+    ) as stream:
+        payloads = [event for event in read_sse(stream) if isinstance(event, dict)]
+
+    done_items = [
+        event["item"]
+        for event in payloads
+        if event["type"] == "response.output_item.done"
+    ]
+    assert [item["type"] for item in done_items] == [
+        "function_call",
+        "function_call_output",
+        "ajac-zero:artifact",
+        "message",
+    ]
+    call_id = done_items[0]["call_id"]
+    assert done_items[1]["call_id"] == call_id
+    assert done_items[2]["call_id"] == call_id
+    assert payloads[-1]["type"] == "response.completed"
+
+
 def test_artifact_item_schema_tolerates_unknown_future_fields():
     """New, additive fields must round-trip rather than raise, so older
     typed consumers keep working against a future minor release."""

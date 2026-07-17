@@ -528,10 +528,13 @@ response.completed         { ... }
 /v1/responses/{id}`, cancel, and the terminal event of a live create — see
 "Artifact expiration is surfaced, not silent" above). `expires_at` is
 refreshed alongside it only while the artifact is still available; once
-`available` flips to `false`, `expires_at` keeps its last-known (already
-past) value rather than being recomputed, so it should be ignored once
-`available` is `false`. Neither field is ever pushed to a copy the client
-already holds. A client that caches an item (e.g. its own database) owns
+`available` flips to `false`, `expires_at` keeps whatever value it last
+had — which may or may not already be in the past, depending on whether
+the cause was natural TTL expiry, capacity eviction, or explicit
+revocation — rather than being recomputed. Ignore `expires_at` once
+`available` is `false`; it carries no meaning at that point. Neither
+field is ever pushed to a copy the client already holds. A client that
+caches an item (e.g. its own database) owns
 re-verifying it — a cached `available: true` can silently go stale, while
 a cached `available: false` for the same `id` will not, since a
 revoked/evicted ID never comes back.
