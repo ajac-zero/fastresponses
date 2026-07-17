@@ -1725,14 +1725,23 @@ def test_artifact_item_schema_tolerates_unknown_future_fields():
     )
 
 
-def test_artifact_item_schema_rejects_malformed_content_url():
+@pytest.mark.parametrize(
+    "content_url",
+    [
+        "https://example.com/artifact_abc123",  # absolute, not a relative path
+        "/v1/artifacts/content",  # missing the artifact_id segment entirely
+        "/v1/artifacts//content",  # empty artifact_id segment
+        "/v1/artifacts/abc/def/content",  # id segment must not contain a slash
+    ],
+)
+def test_artifact_item_schema_rejects_malformed_content_url(content_url):
     payload = {
         "type": "ajac-zero:artifact",
         "id": "artifact_abc123",
         "filename": "report.txt",
         "mime_type": "text/plain",
         "size": 12,
-        "content_url": "https://example.com/artifact_abc123",
+        "content_url": content_url,
         "available": True,
         "expires_at": 1_700_000_000,
     }

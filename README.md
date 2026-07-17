@@ -139,13 +139,18 @@ with zero custom integration.
   (whether the download link is currently expected to work; the
   authoritative signal). `GET /v1/responses/{id}`, `POST
   /v1/responses/{id}/cancel`, and the final `response.completed` /
-  `.incomplete` / `.failed` snapshot of a non-background request (streamed
-  or not, including the WebSocket transport) all recompute these fields
-  against the live registry, so a response never keeps advertising a dead
-  link without saying so — including the narrow case where a same-turn
+  `.incomplete` snapshot of a non-background request (streamed or not,
+  including the WebSocket transport) all recompute these fields against
+  the live registry, so a response never keeps advertising a dead link
+  without saying so — including the narrow case where a same-turn
   registry eviction (another artifact generated later in the same turn
   pushing an earlier one out) would otherwise make the very first response a
-  client sees already stale. Every one of these is a live access: while a
+  client sees already stale. A `.failed` outcome is refreshed the same way
+  when streamed over SSE (its `response.failed` event still carries a full
+  response snapshot); non-streaming HTTP and the WebSocket transport instead
+  surface a `.failed` outcome as an error envelope with no response/artifact
+  data at all, so there is nothing to refresh on those two. Every one of
+  these is a live access: while a
   registered artifact is still live, it extends its download window to a
   fresh full TTL from that moment (sliding expiration) and advances
   `expires_at` to match; once an artifact has expired, been evicted, or been

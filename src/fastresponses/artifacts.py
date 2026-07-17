@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -14,6 +15,11 @@ from pydantic import BaseModel, ConfigDict, field_validator
 #: artifacts. Shared between the ADK adapter (which creates the item) and
 #: the server (which reports live download availability on retrieval).
 ARTIFACT_TYPE = "ajac-zero:artifact"
+
+#: Matches ``content_url`` values of the exact documented form
+#: ``/v1/artifacts/{artifact_id}/content``, requiring a non-empty,
+#: slash-free ``artifact_id`` segment.
+_CONTENT_URL_PATTERN = re.compile(r"/v1/artifacts/[^/]+/content")
 
 
 class ArtifactItem(BaseModel):
@@ -70,10 +76,10 @@ class ArtifactItem(BaseModel):
     @field_validator("content_url")
     @classmethod
     def _content_url_is_relative_download_path(cls, value: str) -> str:
-        if not value.startswith("/v1/artifacts/") or not value.endswith("/content"):
+        if not _CONTENT_URL_PATTERN.fullmatch(value):
             raise ValueError(
                 "content_url must be a relative path of the form "
-                "'/v1/artifacts/{artifact_id}/content'."
+                "'/v1/artifacts/{artifact_id}/content', with a non-empty id."
             )
         return value
 
