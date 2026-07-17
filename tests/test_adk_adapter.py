@@ -1530,6 +1530,62 @@ def test_artifact_registry_is_bounded_and_expires(monkeypatch):
     assert registry.get(second) is None
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_records": 0},
+        {"max_records": -1},
+        {"ttl_seconds": 0},
+        {"ttl_seconds": -1},
+    ],
+)
+def test_artifact_registry_rejects_non_positive_configuration(kwargs):
+    with pytest.raises(ValueError):
+        ArtifactRegistry(**kwargs)
+
+
+def test_adk_adapter_defaults_to_standard_registry_limits():
+    llm = ScriptedLlm(turns=[], requests=[])
+    adapter = ADKAdapter(Agent(name="test_agent", model=llm))
+    assert adapter.artifact_registry.max_records == 1024
+    assert adapter.artifact_registry.ttl_seconds == 3600
+
+
+def test_adk_adapter_forwards_custom_registry_limits():
+    llm = ScriptedLlm(turns=[], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        artifact_registry_max_records=8,
+        artifact_registry_ttl_seconds=30,
+    )
+    assert adapter.artifact_registry.max_records == 8
+    assert adapter.artifact_registry.ttl_seconds == 30
+
+
+def test_adk_adapter_accepts_injected_artifact_registry():
+    llm = ScriptedLlm(turns=[], requests=[])
+    registry = ArtifactRegistry(max_records=2, ttl_seconds=5)
+    adapter = ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry=registry)
+    assert adapter.artifact_registry is registry
+
+
+def test_adk_adapter_rejects_registry_and_limits_together():
+    llm = ScriptedLlm(turns=[], requests=[])
+    registry = ArtifactRegistry(max_records=2, ttl_seconds=5)
+    with pytest.raises(ValueError):
+        ADKAdapter(
+            Agent(name="test_agent", model=llm),
+            artifact_registry=registry,
+            artifact_registry_max_records=8,
+        )
+
+
+def test_adk_adapter_propagates_invalid_registry_limits():
+    llm = ScriptedLlm(turns=[], requests=[])
+    with pytest.raises(ValueError):
+        ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry_max_records=0)
+
+
 def test_multimodal_history_replay_preserves_images():
     client, llm = make_adk_client([text_turn("Still a pixel.")])
     client.post(
