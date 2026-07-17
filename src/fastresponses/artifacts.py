@@ -24,9 +24,9 @@ class ArtifactRegistry:
     """Maps opaque public IDs to exact provider artifact scopes."""
 
     def __init__(self, *, max_records: int = 1024, ttl_seconds: float = 3600) -> None:
-        if max_records <= 0:
+        if not max_records > 0:
             raise ValueError("max_records must be a positive integer.")
-        if ttl_seconds <= 0:
+        if not ttl_seconds > 0:
             raise ValueError("ttl_seconds must be a positive number.")
         self.max_records = max_records
         self.ttl_seconds = ttl_seconds

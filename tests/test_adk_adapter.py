@@ -1537,6 +1537,8 @@ def test_artifact_registry_is_bounded_and_expires(monkeypatch):
         {"max_records": -1},
         {"ttl_seconds": 0},
         {"ttl_seconds": -1},
+        {"ttl_seconds": float("nan")},
+        {"max_records": float("nan")},
     ],
 )
 def test_artifact_registry_rejects_non_positive_configuration(kwargs):
@@ -1580,10 +1582,31 @@ def test_adk_adapter_rejects_registry_and_limits_together():
         )
 
 
+def test_adk_adapter_rejects_registry_and_limits_matching_defaults():
+    # Explicitly passing the same values as the defaults must still be
+    # treated as "the caller configured both", not silently ignored.
+    llm = ScriptedLlm(turns=[], requests=[])
+    registry = ArtifactRegistry(max_records=2, ttl_seconds=5)
+    with pytest.raises(ValueError):
+        ADKAdapter(
+            Agent(name="test_agent", model=llm),
+            artifact_registry=registry,
+            artifact_registry_max_records=1024,
+        )
+    with pytest.raises(ValueError):
+        ADKAdapter(
+            Agent(name="test_agent", model=llm),
+            artifact_registry=registry,
+            artifact_registry_ttl_seconds=3600,
+        )
+
+
 def test_adk_adapter_propagates_invalid_registry_limits():
     llm = ScriptedLlm(turns=[], requests=[])
     with pytest.raises(ValueError):
         ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry_max_records=0)
+    with pytest.raises(ValueError):
+        ADKAdapter(Agent(name="test_agent", model=llm), artifact_registry_ttl_seconds=0)
 
 
 def test_multimodal_history_replay_preserves_images():

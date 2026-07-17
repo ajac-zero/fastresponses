@@ -479,13 +479,13 @@ class ADKAdapter(AgentAdapter):
         input_file_reference_store: InputFileReferenceStore | None = None,
         internal_tool_response_mapper: InternalToolResponseMapper | None = None,
         artifact_registry: ArtifactRegistry | None = None,
-        artifact_registry_max_records: int = 1024,
-        artifact_registry_ttl_seconds: float = 3600,
+        artifact_registry_max_records: int | None = None,
+        artifact_registry_ttl_seconds: float | None = None,
     ) -> None:
         if input_file_routes is not None and input_file_router is not None:
             raise ValueError("Configure input_file_routes or input_file_router, not both.")
         if artifact_registry is not None and (
-            artifact_registry_max_records != 1024 or artifact_registry_ttl_seconds != 3600
+            artifact_registry_max_records is not None or artifact_registry_ttl_seconds is not None
         ):
             raise ValueError(
                 "Configure artifact_registry or artifact_registry_max_records/"
@@ -498,8 +498,16 @@ class ADKAdapter(AgentAdapter):
         self.artifact_service = artifact_service or InMemoryArtifactService()
         self.default_model = model_name or self._infer_model_name(agent)
         self.artifact_registry = artifact_registry or ArtifactRegistry(
-            max_records=artifact_registry_max_records,
-            ttl_seconds=artifact_registry_ttl_seconds,
+            max_records=(
+                artifact_registry_max_records
+                if artifact_registry_max_records is not None
+                else 1024
+            ),
+            ttl_seconds=(
+                artifact_registry_ttl_seconds
+                if artifact_registry_ttl_seconds is not None
+                else 3600
+            ),
         )
         self.internal_tool_response_mapper = internal_tool_response_mapper
         origins: set[str] = set()
