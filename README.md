@@ -440,6 +440,103 @@ persistent `SessionService` (e.g. `DatabaseSessionService`) passed to
 Pydantic AI adapter keeps all conversation state in the response store
 already.
 
+## Artifact item schema
+
+`ajac-zero:artifact` is an `ajac-zero`-namespaced extension item (a
+`CustomItem` in `fastresponses.models` terms) surfaced by the Google ADK
+adapter for downloadable generated artifacts (reports, files, images, ...
+saved during a turn). This section is the formal, field-by-field contract
+for that item, so consumers can implement handling for it without reading
+adapter source. A typed model matching this contract ships as
+`fastresponses.artifacts.ArtifactItem`, together with a
+`parse_artifact_item(item)` helper that validates and parses any response
+output item as one:
+
+```python
+from fastresponses.artifacts import parse_artifact_item
+
+for item in response["output"]:
+    if item["type"] == "ajac-zero:artifact":
+        artifact = parse_artifact_item(item)
+        if artifact.available:
+            download(artifact.content_url)
+```
+
+### Fields
+
+| Field | Type | Presence | Notes |
+| --- | --- | --- | --- |
+| `type` | `str` | always | Always the literal `"ajac-zero:artifact"`. |
+| `id` | `str` | always | Opaque `ArtifactRegistry` token. Treat as an opaque string — no format is guaranteed beyond uniqueness. |
+| `status` | `str` | always | Always `"completed"` today; this item is only ever emitted once the artifact is fully saved. |
+| `filename` | `str` | always | Provider-declared filename, arbitrary Unicode. Not guaranteed unique across an entire conversation (later turns may reuse a filename as a new version). |
+| `mime_type` | `str` | always | E.g. `"application/pdf"`. Best-effort (declared by the tool/provider, or guessed from the filename extension, falling back to `"application/octet-stream"`); not schema-enforced against the served `Content-Type`, which applies its own stricter fallback at download time. |
+| `size` | `int` | always | Byte length of the artifact content (not characters). |
+| `content_url` | `str` | always | Always a **relative path** of the exact form `/v1/artifacts/{id}/content` — never an absolute URL. Resolve it against the same origin/base URL you used for the Responses API call. |
+| `available` | `bool` | always | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older/frozen copy) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
+| `expires_at` | `int` | always | Unix seconds. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. |
+| `call_id` | `str` | conditional | Present **only** for mapper-created artifacts (see "Construction paths" below). Its absence is meaningful — it means the artifact was not produced in response to a specific internal tool call — not missing data. |
+
+### Construction paths
+
+The item is identical in shape regardless of path, but `call_id` presence
+differs:
+
+- **Session-generated** (no `call_id`): the agent's own tool code calls
+  ADK's `tool_context.save_artifact(...)` directly; the adapter picks this
+  up from the turn's `artifact_delta` with no linkage back to a specific
+  tool call.
+- **Mapper-created** (always has `call_id`): an `internal_tool_response_mapper`
+  calls `ADKToolResponse.create_artifact(filename, data, mime_type)`, which
+  threads the call_id of the internal `function_call`/`function_call_output`
+  pair that triggered it through to the resulting item.
+
+### Item ordering examples
+
+Non-streaming, session-generated (agent's tool called `save_artifact`
+directly — no linkage to a specific call, so no adjacent function-call
+pair is guaranteed):
+
+```json
+{
+  "output": [
+    { "type": "ajac-zero:artifact", "id": "artifact_...", "filename": "report.txt", "...": "no call_id key present" },
+    { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Report ready." }] }
+  ]
+}
+```
+
+Streaming, mapper-created (`internal_tool_response_mapper` calling
+`create_artifact`), showing `response.output_item.done` order — the
+artifact always lands immediately after the internal call pair that
+produced it:
+
+```
+response.output_item.done  { "type": "function_call", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "function_call_output", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "ajac-zero:artifact", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "message", ... }
+response.completed         { ... }
+```
+
+### Mutability and backward compatibility
+
+`available`/`expires_at` are recomputed fresh on every live read (`GET
+/v1/responses/{id}`, cancel, and the terminal event of a live create — see
+"Artifact expiration is surfaced, not silent" above); they are never
+pushed to a copy the client already holds. A client that caches an item
+(e.g. its own database) owns re-verifying it — a cached `available: true`
+can silently go stale, while a cached `available: false` for the same
+`id` will not, since a revoked/evicted ID never comes back.
+
+The fields listed as "always" present will not be removed or repurposed
+without a breaking (major) release. `call_id` will continue to be present
+only when applicable. New, additive fields may appear in a future minor
+release; `ArtifactItem` (and `CustomItem` generally) is permissive
+(`extra="allow"`), so unrecognized fields are preserved through
+round-tripping rather than rejected — forward-compatible consumers should
+do the same rather than assuming the field list above is exhaustive.
+
 ## Writing an adapter for another framework
 
 Implement `AgentAdapter` — an async generator that translates one turn into a

@@ -57,7 +57,7 @@ from ..adapter import (  # noqa: I001
     TextDelta,
     UsageDelta,
 )
-from ..artifacts import ARTIFACT_TYPE, ArtifactRecord, ArtifactRegistry
+from ..artifacts import ArtifactItem, ArtifactRecord, ArtifactRegistry
 from ..compaction import expand_compaction_item
 from ..models import (
     CompactionItem,
@@ -1735,19 +1735,16 @@ class _EventTranslator:
                 mime_type=mime_type,
             )
         )
+        artifact = ArtifactItem(
+            id=artifact_id,
+            filename=filename,
+            mime_type=mime_type,
+            size=len(blob.data),
+            content_url=f"/v1/artifacts/{artifact_id}/content",
+            available=True,
+            expires_at=int(time.time() + self.artifact_registry.ttl_seconds),
+            call_id=call_id or None,
+        )
         return ItemDone(
-            CustomItem.model_validate(
-                {
-                    "type": ARTIFACT_TYPE,
-                    "id": artifact_id,
-                    "status": "completed",
-                    "filename": filename,
-                    "mime_type": mime_type,
-                    "size": len(blob.data),
-                    "content_url": f"/v1/artifacts/{artifact_id}/content",
-                    "available": True,
-                    "expires_at": int(time.time() + self.artifact_registry.ttl_seconds),
-                    **({"call_id": call_id} if call_id else {}),
-                }
-            )
+            CustomItem.model_validate(artifact.model_dump(mode="json", exclude_none=True))
         )

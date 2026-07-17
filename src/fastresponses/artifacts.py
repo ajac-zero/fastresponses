@@ -6,12 +6,91 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from .models import ItemStatus
 
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
 #: artifacts. Shared between the ADK adapter (which creates the item) and
 #: the server (which reports live download availability on retrieval).
 ARTIFACT_TYPE = "ajac-zero:artifact"
+
+
+class ArtifactItem(BaseModel):
+    """Formal, typed schema for the ``ajac-zero:artifact`` extension item.
+
+    The Google ADK adapter surfaces generated artifacts through two
+    distinct code paths, both producing this same item shape:
+
+    - **Session-generated**: the agent's own tool code calls ADK's
+      ``tool_context.save_artifact(...)`` directly, and the adapter picks
+      it up from the turn's ``artifact_delta``. These items never carry
+      ``call_id`` — ADK does not link the resulting delta back to a
+      specific tool call.
+    - **Mapper-created**: an ``internal_tool_response_mapper`` calls
+      ``ADKToolResponse.create_artifact(...)``. These items always carry
+      ``call_id``, tying the artifact back to the internal
+      ``function_call`` / ``function_call_output`` pair that produced it.
+
+    See the "Artifact item schema" section of ``README.md`` for the full
+    field-by-field contract (including backward-compatibility guarantees).
+    This model exists so consumers can parse and validate artifact items
+    without reading adapter source code; it is intentionally permissive
+    about unknown fields (``extra="allow"``) so that new, additive fields
+    introduced in a future release still round-trip through it instead of
+    raising.
+
+    Stability summary:
+
+    - ``type``, ``id``, ``status``, ``filename``, ``mime_type``, ``size``,
+      ``content_url``, ``available``, and ``expires_at`` are always
+      present.
+    - ``call_id`` is present only for mapper-created artifacts; its
+      absence is meaningful, not missing data.
+    - ``available: False`` is authoritative (never attempt the download).
+      ``available: True`` or absent is best-effort only, never a
+      guarantee — always attempt the download and handle failure.
+    - ``expires_at`` is advisory (a predicted Unix-seconds deadline), not
+      an exact guarantee.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["ajac-zero:artifact"] = ARTIFACT_TYPE
+    id: str
+    status: ItemStatus | None = "completed"
+    filename: str
+    mime_type: str
+    size: int
+    content_url: str
+    available: bool
+    expires_at: int
+    call_id: str | None = None
+
+    @field_validator("content_url")
+    @classmethod
+    def _content_url_is_relative_download_path(cls, value: str) -> str:
+        if not value.startswith("/v1/artifacts/") or not value.endswith("/content"):
+            raise ValueError(
+                "content_url must be a relative path of the form "
+                "'/v1/artifacts/{artifact_id}/content'."
+            )
+        return value
+
+
+def parse_artifact_item(item: Any) -> ArtifactItem:
+    """Parse a response output item as a typed, validated ``ArtifactItem``.
+
+    Accepts a pydantic model instance (e.g. the ``CustomItem`` fastresponses
+    itself emits) or a plain ``dict`` (e.g. read back from stored JSON).
+    Raises ``pydantic.ValidationError`` if ``item`` is not a well-formed
+    ``ajac-zero:artifact`` item, including when its ``type`` does not
+    match.
+    """
+    payload = item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+    return ArtifactItem.model_validate(payload)
 
 
 @dataclass(frozen=True)
