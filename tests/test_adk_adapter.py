@@ -954,6 +954,125 @@ def test_generated_artifact_download_preserves_unicode_filename():
     )
 
 
+def _make_artifact_adapter(turns, **agent_kwargs):
+    llm = ScriptedLlm(turns=list(turns), requests=[])
+    agent = Agent(name="test_agent", model=llm, instruction="Be helpful.", **agent_kwargs)
+    adapter = ADKAdapter(agent, app_name="test-app")
+    return TestClient(create_app(adapter)), adapter
+
+
+def _generated_artifacts(body: dict) -> list[dict]:
+    return [item for item in body["output"] if item["type"] == "ajac-zero:artifact"]
+
+
+def test_revoked_artifact_immediately_returns_not_found():
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    revoke = client.delete(f"/v1/artifacts/{artifact['id']}")
+    assert revoke.status_code == 200
+    assert revoke.json() == {
+        "id": artifact["id"],
+        "object": "artifact",
+        "deleted": True,
+    }
+
+    download = client.get(artifact["content_url"])
+    assert download.status_code == 404
+    assert download.json()["error"]["code"] == "artifact_not_found"
+
+    second = client.delete(f"/v1/artifacts/{artifact['id']}")
+    assert second.status_code == 404
+    assert second.json()["error"]["code"] == "artifact_not_found"
+
+
+def test_revoking_unknown_artifact_returns_not_found():
+    client, _ = _make_artifact_adapter([text_turn("Hi.")])
+    response = client.delete("/v1/artifacts/artifact_unknown")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "artifact_not_found"
+
+
+def test_revoking_last_reference_deletes_provider_content():
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+    assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+    assert "report.txt" not in str(adapter.artifact_service.artifacts)
+
+
+def test_revoking_one_version_preserves_other_versions():
+    client, adapter = _make_artifact_adapter(
+        [
+            call_turn("save_report", {}),
+            call_turn("save_report", {}),
+            text_turn("Two reports saved."),
+        ],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make two reports"}).json()
+    first, second = _generated_artifacts(body)
+    assert first["id"] != second["id"]
+
+    assert client.delete(f"/v1/artifacts/{second['id']}").status_code == 200
+
+    # The other version keeps its public record and its provider content.
+    assert client.get(second["content_url"]).status_code == 404
+    download = client.get(first["content_url"])
+    assert download.status_code == 200
+    assert download.content == b"generated report"
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+
+def test_provider_cleanup_failure_does_not_restore_access(monkeypatch):
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    async def failing_delete(self, **kwargs):
+        raise RuntimeError("provider is down")
+
+    monkeypatch.setattr(
+        type(adapter.artifact_service), "delete_artifact", failing_delete
+    )
+
+    revoke = client.delete(f"/v1/artifacts/{artifact['id']}")
+    assert revoke.status_code == 200
+    assert revoke.json()["deleted"] is True
+    assert client.get(artifact["content_url"]).status_code == 404
+
+
+def test_deleting_response_does_not_revoke_artifacts():
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    deleted = client.delete(f"/v1/responses/{body['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+
+    # Artifact lifecycle is independent of stored responses: items may be
+    # replayed into forked or continued conversations.
+    download = client.get(artifact["content_url"])
+    assert download.status_code == 200
+    assert download.content == b"generated report"
+
+
 def test_inline_input_file_is_not_emitted_as_output_artifact():
     llm = ScriptedLlm(turns=[text_turn("Read it.")], requests=[])
     adapter = ADKAdapter(
@@ -1557,6 +1676,62 @@ def test_artifact_registry_is_bounded_and_expires(monkeypatch):
     assert registry.get(second) is record
     now["value"] = 11
     assert registry.get(second) is None
+
+
+def test_artifact_registry_revoke_removes_only_the_target_record(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    service = object()
+    v0 = ArtifactRecord(service, "app", "user", "session", "a.txt", 0, "text/plain")
+    v1 = ArtifactRecord(service, "app", "user", "session", "a.txt", 1, "text/plain")
+    first = registry.register(v0)
+    second = registry.register(v1)
+
+    assert registry.revoke(second) is v1
+    assert registry.get(second) is None
+    assert registry.get(first) is v0
+    assert registry.revoke(second) is None
+    assert registry.revoke("artifact_unknown") is None
+
+
+def test_artifact_registry_revoke_treats_expired_records_as_unknown(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    record = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    artifact_id = registry.register(record)
+    now["value"] = 11
+    assert registry.revoke(artifact_id) is None
+
+
+def test_artifact_registry_live_reference_is_version_insensitive(monkeypatch):
+    now = {"value": 0.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    service = object()
+    v0 = ArtifactRecord(service, "app", "user", "session", "a.txt", 0, "text/plain")
+    v1 = ArtifactRecord(service, "app", "user", "session", "a.txt", 1, "text/plain")
+    other = ArtifactRecord(service, "app", "user", "session", "b.txt", 0, "text/plain")
+    registry.register(v0)
+    other_id = registry.register(other)
+
+    # Another live record targets the same provider filename (any version).
+    assert registry.has_live_reference(v1) is True
+    # No live record targets a revoked, unrelated filename.
+    registry.revoke(other_id)
+    assert registry.has_live_reference(other) is False
+    # Expired records do not count as live references.
+    now["value"] = 11
+    assert registry.has_live_reference(v1) is False
+
+
+def test_artifact_registry_live_reference_requires_the_same_service():
+    registry = ArtifactRegistry(max_records=4, ttl_seconds=10)
+    record = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    twin = ArtifactRecord(object(), "app", "user", "session", "a.txt", 0, "text/plain")
+    registry.register(record)
+    assert registry.has_live_reference(twin) is False
 
 
 @pytest.mark.parametrize(

@@ -17,12 +17,17 @@ Implements the core Open Responses surface:
   background response.
 - ``GET /v1/responses/{response_id}/events`` — replay/resume the event
   stream of a background response (``?starting_after=<sequence_number>``).
+- ``GET /v1/artifacts/{artifact_id}/content`` — download a generated
+  artifact.
+- ``DELETE /v1/artifacts/{artifact_id}`` — revoke a generated artifact
+  download ID.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections import OrderedDict
@@ -58,6 +63,8 @@ from .store import InMemoryResponseStore, ResponseStore, StoredResponse
 WS_LOCAL_CACHE_LIMIT = 32
 
 # WebSocket connections are limited to 60 minutes per the specification.
+logger = logging.getLogger(__name__)
+
 WS_CONNECTION_LIMIT_SECONDS = 60 * 60
 
 # HTTP/SSE transport-specific fields that must not be part of a WebSocket
@@ -429,6 +436,44 @@ def create_app(
                 "X-Content-Type-Options": "nosniff",
                 "Cache-Control": "private, no-store",
             },
+        )
+
+    @app.delete("/v1/artifacts/{artifact_id}")
+    async def delete_artifact(artifact_id: str, request: Request):
+        """Revoke a generated artifact download ID.
+
+        Public access is removed before provider cleanup is attempted, so a
+        provider failure can never restore access to a revoked ID. Provider
+        content is deleted only when no other live registry record references
+        the same provider filename, because provider deletion is
+        filename-wide and would otherwise remove unrelated versions.
+        """
+        await _authorize(request)
+        registry = app.state.artifact_registry
+        record = registry.revoke(artifact_id) if registry is not None else None
+        if record is None:
+            raise ApiError(
+                f"Artifact with id '{artifact_id}' not found.",
+                type="not_found",
+                code="artifact_not_found",
+                param="artifact_id",
+            )
+        if not registry.has_live_reference(record):
+            try:
+                await record.service.delete_artifact(
+                    app_name=record.app_name,
+                    user_id=record.user_id,
+                    session_id=record.session_id,
+                    filename=record.filename,
+                )
+            except Exception:
+                logger.warning(
+                    "Provider cleanup failed for revoked artifact '%s'.",
+                    artifact_id,
+                    exc_info=True,
+                )
+        return JSONResponse(
+            content={"id": artifact_id, "object": "artifact", "deleted": True}
         )
 
     @app.post("/v1/responses/{response_id}/cancel")

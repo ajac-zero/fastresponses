@@ -90,6 +90,19 @@ with zero custom integration.
       artifact_registry_max_records=256,
   )
   ```
+- **Artifact lifecycle**: a download ID stops resolving when it expires, when
+  it is evicted by capacity, or when it is explicitly revoked with
+  `DELETE /v1/artifacts/{artifact_id}` (or `ArtifactRegistry.revoke()`); all
+  three return the same non-disclosing `artifact_not_found` error afterwards.
+  Expiration and eviction remove only the public download record and leave
+  provider content in place. Revocation removes public access first and then
+  best-effort deletes the provider content, but only when no other live
+  download ID references the same provider filename — provider deletion is
+  filename-wide, so this keeps other registered versions downloadable. A
+  provider cleanup failure never restores public access to a revoked ID.
+  Deleting or cancelling a response does not revoke its artifacts, because
+  artifact items may be replayed into forked or continued conversations;
+  revoke IDs explicitly when they must stop resolving.
 - **Reasoning**: model "thought" parts (e.g. Gemini thought summaries) are
   surfaced as `reasoning` output items with streamed
   `response.reasoning_summary_text.delta` events; thought signatures are attached

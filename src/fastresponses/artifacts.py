@@ -51,6 +51,38 @@ class ArtifactRegistry:
         self._records.move_to_end(artifact_id)
         return record
 
+    def revoke(self, artifact_id: str) -> ArtifactRecord | None:
+        """Remove public access to ``artifact_id`` immediately.
+
+        Returns the revoked record, or ``None`` when the ID is unknown or
+        already expired so callers cannot distinguish the two cases.
+        """
+        entry = self._records.pop(artifact_id, None)
+        if entry is None:
+            return None
+        expires_at, record = entry
+        if expires_at <= time.monotonic():
+            return None
+        return record
+
+    def has_live_reference(self, record: ArtifactRecord) -> bool:
+        """Whether any live record targets the same provider artifact filename.
+
+        Provider artifact deletion is filename-wide (it removes every stored
+        version), so callers must not delete provider content while another
+        registered record still references the same scope and filename.
+        """
+        now = time.monotonic()
+        return any(
+            expires_at > now
+            and other.service is record.service
+            and other.app_name == record.app_name
+            and other.user_id == record.user_id
+            and other.session_id == record.session_id
+            and other.filename == record.filename
+            for expires_at, other in self._records.values()
+        )
+
     def _purge_expired(self) -> None:
         now = time.monotonic()
         for artifact_id, (expires_at, _) in list(self._records.items()):
