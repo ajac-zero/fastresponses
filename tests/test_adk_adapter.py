@@ -1405,6 +1405,64 @@ def test_cancel_response_reports_revoked_artifact_as_unavailable():
         assert refreshed["available"] is False
 
 
+def test_cancel_response_reports_expired_artifact_as_unavailable(monkeypatch):
+    now = {"value": 1_000.0}
+    monkeypatch.setattr("fastresponses.artifacts.time.monotonic", lambda: now["value"])
+    monkeypatch.setattr("fastresponses.artifacts.time.time", lambda: now["value"])
+    registry = ArtifactRegistry(max_records=8, ttl_seconds=10)
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+        adapter_kwargs={"artifact_registry": registry},
+    )
+    with client:
+        queued = client.post(
+            "/v1/responses", json={"input": "make a report", "background": True}
+        ).json()
+        body = _wait_for_status(client, queued["id"], {"completed"})
+        artifact = _generated_artifacts(body)[0]
+        assert artifact["available"] is True
+
+        now["value"] = 1_011.0
+        cancelled = client.post(f"/v1/responses/{body['id']}/cancel").json()
+        assert cancelled["status"] == "completed"
+        refreshed = _generated_artifacts(cancelled)[0]
+        assert refreshed["available"] is False
+
+
+def test_events_endpoint_replays_frozen_artifact_state_after_revocation():
+    """The resumable event log is a point-in-time record: it must not
+    reflect a later revocation, unlike GET /v1/responses/{id}."""
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    with client:
+        queued = client.post(
+            "/v1/responses", json={"input": "make a report", "background": True}
+        ).json()
+        body = _wait_for_status(client, queued["id"], {"completed"})
+        artifact = _generated_artifacts(body)[0]
+        assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+
+        with client.stream(
+            "GET", f"/v1/responses/{body['id']}/events"
+        ) as r:
+            events = [e for e in read_sse(r) if isinstance(e, dict)]
+
+    artifact_events = [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.done"
+        and e.get("item", {}).get("type") == "ajac-zero:artifact"
+    ]
+    assert len(artifact_events) == 1
+    assert artifact_events[0]["item"]["available"] is True
+
+    refetched = client.get(f"/v1/responses/{body['id']}").json()
+    assert _generated_artifacts(refetched)[0]["available"] is False
+
+
 def test_get_response_reports_evicted_artifact_as_unavailable():
     registry = ArtifactRegistry(max_records=1, ttl_seconds=3600)
     client, _ = _make_artifact_adapter(
