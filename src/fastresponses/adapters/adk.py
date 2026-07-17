@@ -28,6 +28,7 @@ import mimetypes
 import re
 import uuid
 import weakref
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -656,6 +657,12 @@ class ADKAdapter(AgentAdapter):
         self._input_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # Revoked records whose provider content deletion failed and can be
+        # retried via revoke_artifact(..., delete_content=True). Bounded by
+        # the registry capacity; never consulted for downloads.
+        self._pending_artifact_cleanup: OrderedDict[str, ArtifactRecord] = (
+            OrderedDict()
+        )
 
     @staticmethod
     def _validate_input_file_action(action: str) -> None:
@@ -699,6 +706,58 @@ class ADKAdapter(AgentAdapter):
     async def run(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
         async for event in self._run_locked(run):
             yield event
+
+    async def revoke_artifact(
+        self, artifact_id: str, *, delete_content: bool = False
+    ) -> bool:
+        """Revoke a generated artifact download ID.
+
+        Public access is removed first, so a revoked ID resolves to
+        ``artifact_not_found`` immediately and stays revoked even when
+        provider cleanup fails afterwards. Unlike the HTTP endpoint,
+        provider cleanup failures propagate to the caller, and the cleanup
+        stays retryable: calling ``revoke_artifact`` again with
+        ``delete_content=True`` re-attempts the provider deletion.
+
+        With ``delete_content=True`` the provider bytes are also deleted,
+        unless another live download ID still references any version of the
+        same filename in the same scope: ADK artifact services delete every
+        version of a filename at once, so content deletion is skipped in
+        that case to keep unrelated versions downloadable.
+
+        Returns ``True`` when a live download ID was revoked or a pending
+        provider cleanup was completed, and ``False`` for unknown, expired,
+        or already-revoked IDs.
+        """
+        record = self.artifact_registry.revoke(artifact_id)
+        if record is None:
+            if not delete_content:
+                return False
+            record = self._pending_artifact_cleanup.get(artifact_id)
+            if record is None:
+                return False
+        if delete_content and not self.artifact_registry.has_live_reference(record):
+            try:
+                await record.service.delete_artifact(
+                    app_name=record.app_name,
+                    user_id=record.user_id,
+                    session_id=record.session_id,
+                    filename=record.filename,
+                )
+            except BaseException:
+                # Keep the revoked record so a later delete_content=True call
+                # can retry the provider cleanup. The record is never served
+                # from here, so public access stays revoked either way.
+                self._pending_artifact_cleanup[artifact_id] = record
+                self._pending_artifact_cleanup.move_to_end(artifact_id)
+                while (
+                    len(self._pending_artifact_cleanup)
+                    > self.artifact_registry.max_records
+                ):
+                    self._pending_artifact_cleanup.popitem(last=False)
+                raise
+        self._pending_artifact_cleanup.pop(artifact_id, None)
+        return True
 
     async def _run_locked(self, run: AgentRun) -> AsyncIterator[AdapterEvent]:
         state = dict(run.previous_state or {})

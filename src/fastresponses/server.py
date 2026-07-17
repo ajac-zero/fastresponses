@@ -20,7 +20,7 @@ Implements the core Open Responses surface:
 - ``GET /v1/artifacts/{artifact_id}/content`` — download a generated
   artifact.
 - ``DELETE /v1/artifacts/{artifact_id}`` — revoke a generated artifact
-  download ID.
+  download ID (``?delete_content=true`` also deletes the provider bytes).
 """
 
 from __future__ import annotations
@@ -60,11 +60,11 @@ from .models import (
 )
 from .store import InMemoryResponseStore, ResponseStore, StoredResponse
 
+logger = logging.getLogger(__name__)
+
 WS_LOCAL_CACHE_LIMIT = 32
 
 # WebSocket connections are limited to 60 minutes per the specification.
-logger = logging.getLogger(__name__)
-
 WS_CONNECTION_LIMIT_SECONDS = 60 * 60
 
 # HTTP/SSE transport-specific fields that must not be part of a WebSocket
@@ -439,39 +439,63 @@ def create_app(
         )
 
     @app.delete("/v1/artifacts/{artifact_id}")
-    async def delete_artifact(artifact_id: str, request: Request):
+    async def delete_artifact(
+        artifact_id: str, request: Request, delete_content: bool = False
+    ):
         """Revoke a generated artifact download ID.
 
-        Public access is removed before provider cleanup is attempted, so a
-        provider failure can never restore access to a revoked ID. Provider
-        content is deleted only when no other live registry record references
+        By default only public access is removed: generated artifacts are
+        part of the ADK session context (later agent turns may load them),
+        so revoking a download link must not destroy the underlying bytes.
+        With ``?delete_content=true`` the provider content is also deleted,
+        best-effort, and only when no other live registry record references
         the same provider filename, because provider deletion is
-        filename-wide and would otherwise remove unrelated versions.
+        filename-wide and would otherwise remove unrelated versions. Public
+        access is removed before provider cleanup is attempted, so a
+        provider failure can never restore access to a revoked ID. When the
+        adapter exposes ``revoke_artifact``, a failed cleanup stays
+        retryable by repeating the request with ``?delete_content=true``.
         """
         await _authorize(request)
         registry = app.state.artifact_registry
-        record = registry.revoke(artifact_id) if registry is not None else None
-        if record is None:
+        revoker = getattr(adapter, "revoke_artifact", None)
+        if revoker is not None:
+            try:
+                revoked = await revoker(artifact_id, delete_content=delete_content)
+            except Exception:
+                # revoke_artifact removes public access before provider
+                # cleanup, so a cleanup failure still counts as revoked and
+                # remains retryable through the adapter's pending cleanups.
+                revoked = True
+                logger.warning(
+                    "Provider cleanup failed for revoked artifact '%s'.",
+                    artifact_id,
+                    exc_info=True,
+                )
+        else:
+            record = registry.revoke(artifact_id) if registry is not None else None
+            revoked = record is not None
+            if revoked and delete_content and not registry.has_live_reference(record):
+                try:
+                    await record.service.delete_artifact(
+                        app_name=record.app_name,
+                        user_id=record.user_id,
+                        session_id=record.session_id,
+                        filename=record.filename,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Provider cleanup failed for revoked artifact '%s'.",
+                        artifact_id,
+                        exc_info=True,
+                    )
+        if not revoked:
             raise ApiError(
                 f"Artifact with id '{artifact_id}' not found.",
                 type="not_found",
                 code="artifact_not_found",
                 param="artifact_id",
             )
-        if not registry.has_live_reference(record):
-            try:
-                await record.service.delete_artifact(
-                    app_name=record.app_name,
-                    user_id=record.user_id,
-                    session_id=record.session_id,
-                    filename=record.filename,
-                )
-            except Exception:
-                logger.warning(
-                    "Provider cleanup failed for revoked artifact '%s'.",
-                    artifact_id,
-                    exc_info=True,
-                )
         return JSONResponse(
             content={"id": artifact_id, "object": "artifact", "deleted": True}
         )

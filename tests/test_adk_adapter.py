@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from unittest.mock import patch
@@ -1001,7 +1002,23 @@ def test_revoking_unknown_artifact_returns_not_found():
     assert response.json()["error"]["code"] == "artifact_not_found"
 
 
-def test_revoking_last_reference_deletes_provider_content():
+def test_revocation_keeps_provider_content_by_default():
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+
+    # The link is dead, but the artifact stays in the ADK session context so
+    # later agent turns can still load it.
+    assert client.get(artifact["content_url"]).status_code == 404
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+
+def test_revoking_last_reference_with_delete_content_deletes_provider_content():
     client, adapter = _make_artifact_adapter(
         [call_turn("save_report", {}), text_turn("Report ready.")],
         tools=[save_report],
@@ -1010,7 +1027,8 @@ def test_revoking_last_reference_deletes_provider_content():
     artifact = _generated_artifacts(body)[0]
     assert "report.txt" in str(adapter.artifact_service.artifacts)
 
-    assert client.delete(f"/v1/artifacts/{artifact['id']}").status_code == 200
+    revoke = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=true")
+    assert revoke.status_code == 200
     assert "report.txt" not in str(adapter.artifact_service.artifacts)
 
 
@@ -1027,9 +1045,12 @@ def test_revoking_one_version_preserves_other_versions():
     first, second = _generated_artifacts(body)
     assert first["id"] != second["id"]
 
-    assert client.delete(f"/v1/artifacts/{second['id']}").status_code == 200
+    revoke = client.delete(f"/v1/artifacts/{second['id']}?delete_content=true")
+    assert revoke.status_code == 200
 
-    # The other version keeps its public record and its provider content.
+    # The other version keeps its public record and its provider content:
+    # provider deletion is filename-wide, so it is skipped while a live
+    # sibling record remains.
     assert client.get(second["content_url"]).status_code == 404
     download = client.get(first["content_url"])
     assert download.status_code == 200
@@ -1052,10 +1073,263 @@ def test_provider_cleanup_failure_does_not_restore_access(monkeypatch):
         type(adapter.artifact_service), "delete_artifact", failing_delete
     )
 
-    revoke = client.delete(f"/v1/artifacts/{artifact['id']}")
+    revoke = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=true")
     assert revoke.status_code == 200
     assert revoke.json()["deleted"] is True
     assert client.get(artifact["content_url"]).status_code == 404
+
+
+def test_endpoint_cleanup_failure_is_retryable_after_provider_recovers(monkeypatch):
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    real_delete = type(adapter.artifact_service).delete_artifact
+    provider_down = {"value": True}
+
+    async def flaky_delete(self, **kwargs):
+        if provider_down["value"]:
+            raise RuntimeError("provider is down")
+        return await real_delete(self, **kwargs)
+
+    monkeypatch.setattr(type(adapter.artifact_service), "delete_artifact", flaky_delete)
+
+    # The endpoint stays best-effort: the failure is swallowed, access is
+    # revoked, and the bytes are still there.
+    revoke = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=true")
+    assert revoke.status_code == 200
+    assert client.get(artifact["content_url"]).status_code == 404
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+    # Once the provider recovers, repeating the DELETE completes the pending
+    # cleanup instead of orphaning the bytes forever.
+    provider_down["value"] = False
+    retry = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=true")
+    assert retry.status_code == 200
+    assert retry.json()["deleted"] is True
+    assert "report.txt" not in str(adapter.artifact_service.artifacts)
+
+    # With the cleanup completed, the ID behaves like any revoked ID again.
+    done = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=true")
+    assert done.status_code == 404
+    assert done.json()["error"]["code"] == "artifact_not_found"
+
+
+def test_endpoint_falls_back_to_registry_when_adapter_lacks_revoke_artifact():
+    from fastresponses.adapter import AgentAdapter
+
+    class RegistryOnlyAdapter(AgentAdapter):
+        name = "registry-only"
+
+        def __init__(self):
+            self.artifact_registry = ArtifactRegistry(max_records=4, ttl_seconds=60)
+
+        async def run(self, run):  # pragma: no cover - never invoked
+            yield None
+
+    class RecordingService:
+        def __init__(self):
+            self.deleted: list[str] = []
+
+        async def delete_artifact(self, **kwargs):
+            self.deleted.append(kwargs["filename"])
+
+    adapter = RegistryOnlyAdapter()
+    service = RecordingService()
+    client = TestClient(create_app(adapter))
+
+    def register(filename, version):
+        return adapter.artifact_registry.register(
+            ArtifactRecord(service, "app", "user", "session", filename, version, "text/plain")
+        )
+
+    # Default revocation removes the record without touching provider content.
+    plain_id = register("a.txt", 0)
+    assert client.delete(f"/v1/artifacts/{plain_id}").status_code == 200
+    assert adapter.artifact_registry.get(plain_id) is None
+    assert service.deleted == []
+    assert client.delete(f"/v1/artifacts/{plain_id}").status_code == 404
+
+    # delete_content honours the sibling-version guard in the fallback too.
+    first_id = register("a.txt", 0)
+    second_id = register("a.txt", 1)
+    assert (
+        client.delete(f"/v1/artifacts/{second_id}?delete_content=true").status_code
+        == 200
+    )
+    assert service.deleted == []
+    assert adapter.artifact_registry.get(first_id) is not None
+
+    # With no live siblings left, delete_content deletes the provider bytes.
+    assert (
+        client.delete(f"/v1/artifacts/{first_id}?delete_content=true").status_code
+        == 200
+    )
+    assert service.deleted == ["a.txt"]
+
+    # Unknown IDs stay non-disclosing.
+    unknown = client.delete("/v1/artifacts/artifact_unknown")
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "artifact_not_found"
+
+
+def test_pending_cleanup_map_is_bounded_by_registry_capacity():
+    llm = ScriptedLlm(turns=[], requests=[])
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm),
+        artifact_registry_max_records=1,
+        artifact_registry_ttl_seconds=60,
+    )
+
+    class FlakyService:
+        def __init__(self):
+            self.fail = True
+            self.deleted: list[str] = []
+
+        async def delete_artifact(self, **kwargs):
+            if self.fail:
+                raise RuntimeError("provider is down")
+            self.deleted.append(kwargs["filename"])
+
+    service = FlakyService()
+    id_a = adapter.artifact_registry.register(
+        ArtifactRecord(service, "app", "user", "session", "a.txt", 0, "text/plain")
+    )
+    with pytest.raises(RuntimeError):
+        asyncio.run(adapter.revoke_artifact(id_a, delete_content=True))
+    id_b = adapter.artifact_registry.register(
+        ArtifactRecord(service, "app", "user", "session", "b.txt", 0, "text/plain")
+    )
+    with pytest.raises(RuntimeError):
+        asyncio.run(adapter.revoke_artifact(id_b, delete_content=True))
+
+    # The bound (max_records=1) evicted the oldest pending cleanup, so only
+    # the newest one stays retryable; evicted IDs behave like revoked IDs.
+    service.fail = False
+    assert asyncio.run(adapter.revoke_artifact(id_a, delete_content=True)) is False
+    assert asyncio.run(adapter.revoke_artifact(id_b, delete_content=True)) is True
+    assert service.deleted == ["b.txt"]
+
+
+def test_adapter_revoke_artifact_removes_access_but_keeps_content():
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    assert asyncio.run(adapter.revoke_artifact(artifact["id"])) is True
+    assert client.get(artifact["content_url"]).status_code == 404
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+    # Unknown, expired, and already-revoked IDs are indistinguishable.
+    assert asyncio.run(adapter.revoke_artifact(artifact["id"])) is False
+    assert asyncio.run(adapter.revoke_artifact("artifact_unknown")) is False
+
+
+def test_adapter_revoke_artifact_with_delete_content_removes_provider_bytes():
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    revoked = asyncio.run(adapter.revoke_artifact(artifact["id"], delete_content=True))
+    assert revoked is True
+    assert client.get(artifact["content_url"]).status_code == 404
+    assert "report.txt" not in str(adapter.artifact_service.artifacts)
+
+
+def test_adapter_revoke_artifact_preserves_sibling_versions():
+    client, adapter = _make_artifact_adapter(
+        [
+            call_turn("save_report", {}),
+            call_turn("save_report", {}),
+            text_turn("Two reports saved."),
+        ],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make two reports"}).json()
+    first, second = _generated_artifacts(body)
+
+    # A live sibling download ID blocks filename-wide provider deletion.
+    revoked = asyncio.run(adapter.revoke_artifact(second["id"], delete_content=True))
+    assert revoked is True
+    assert client.get(second["content_url"]).status_code == 404
+    download = client.get(first["content_url"])
+    assert download.status_code == 200
+    assert download.content == b"generated report"
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+    # With no live siblings left, content deletion proceeds.
+    revoked = asyncio.run(adapter.revoke_artifact(first["id"], delete_content=True))
+    assert revoked is True
+    assert "report.txt" not in str(adapter.artifact_service.artifacts)
+
+
+def test_delete_endpoint_rejects_invalid_delete_content_value():
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    response = client.delete(f"/v1/artifacts/{artifact['id']}?delete_content=banana")
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request"
+    assert response.json()["error"]["code"] == "invalid_value"
+
+    # The invalid request neither revoked the link nor deleted the content.
+    assert client.get(artifact["content_url"]).status_code == 200
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+
+def test_adapter_revoke_artifact_provider_failure_is_retryable(monkeypatch):
+    client, adapter = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    artifact = _generated_artifacts(body)[0]
+
+    real_delete = type(adapter.artifact_service).delete_artifact
+    provider_down = {"value": True}
+
+    async def flaky_delete(self, **kwargs):
+        if provider_down["value"]:
+            raise RuntimeError("provider is down")
+        return await real_delete(self, **kwargs)
+
+    monkeypatch.setattr(type(adapter.artifact_service), "delete_artifact", flaky_delete)
+
+    # Unlike the HTTP endpoint, the adapter surfaces the cleanup failure so
+    # callers can retry, but public access stays revoked either way.
+    with pytest.raises(RuntimeError):
+        asyncio.run(adapter.revoke_artifact(artifact["id"], delete_content=True))
+    assert client.get(artifact["content_url"]).status_code == 404
+    assert "report.txt" in str(adapter.artifact_service.artifacts)
+
+    # Without delete_content the ID counts as already revoked, and the
+    # pending provider cleanup is left for a later delete_content retry.
+    assert asyncio.run(adapter.revoke_artifact(artifact["id"])) is False
+
+    # Once the provider recovers, retrying completes the deferred cleanup.
+    provider_down["value"] = False
+    revoked = asyncio.run(adapter.revoke_artifact(artifact["id"], delete_content=True))
+    assert revoked is True
+    assert "report.txt" not in str(adapter.artifact_service.artifacts)
+    assert client.get(artifact["content_url"]).status_code == 404
+
+    # The completed cleanup is not retryable again.
+    assert (
+        asyncio.run(adapter.revoke_artifact(artifact["id"], delete_content=True))
+        is False
+    )
 
 
 def test_deleting_response_does_not_revoke_artifacts():
