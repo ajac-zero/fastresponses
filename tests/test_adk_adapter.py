@@ -1725,6 +1725,29 @@ def test_artifact_item_schema_tolerates_unknown_future_fields():
     )
 
 
+def test_artifact_item_schema_tolerates_pre_expiration_items_missing_fields():
+    """available/expires_at were added to this item in a later release
+    (fastresponses#19); an item predating them (e.g. replayed from
+    GET /v1/responses/{id}/events, or read back from a response store
+    populated by an earlier release) must still parse, defaulting to the
+    documented best-effort semantics rather than raising."""
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "status": "completed",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": "/v1/artifacts/artifact_abc123/content",
+        # no "available", no "expires_at"
+    }
+
+    artifact = parse_artifact_item(payload)
+
+    assert artifact.available is True
+    assert artifact.expires_at is None
+
+
 @pytest.mark.parametrize(
     "content_url",
     [

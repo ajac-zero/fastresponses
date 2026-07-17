@@ -478,9 +478,11 @@ for item in response["output"]:
 | `mime_type` | `str` | always | E.g. `"application/pdf"`. Best-effort (declared by the tool/provider, or guessed from the filename extension, falling back to `"application/octet-stream"`); not schema-enforced against the served `Content-Type`, which applies its own stricter fallback at download time. |
 | `size` | `int` | always | Byte length of the artifact content (not characters). |
 | `content_url` | `str` | always | Always a **relative path** of the exact form `/v1/artifacts/{id}/content` — never an absolute URL. Resolve it against the same origin/base URL you used for the Responses API call. |
-| `available` | `bool` | always | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older/frozen copy) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
-| `expires_at` | `int` | always | Unix seconds. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. |
+| `available` | `bool` | always* | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older item predating this field) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
+| `expires_at` | `int` | always* | Unix seconds. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. Absent means unknown, not "never expires." |
 | `call_id` | `str` | conditional | Present **only** for mapper-created artifacts (see "Construction paths" below). Its absence is meaningful — it means the artifact was not produced in response to a specific internal tool call — not missing data. |
+
+\* Always present on items produced by the current adapter. `ArtifactItem`/`parse_artifact_item` default a missing `available` to `True` and a missing `expires_at` to `None` rather than raising, so older items predating these fields (e.g. replayed via `GET /v1/responses/{id}/events`, or read back from a response store populated by an earlier release) still parse — consistent with treating an absent `available` as best-effort-true.
 
 ### Construction paths
 

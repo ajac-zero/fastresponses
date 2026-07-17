@@ -48,16 +48,23 @@ class ArtifactItem(BaseModel):
 
     Stability summary:
 
-    - ``type``, ``id``, ``status``, ``filename``, ``mime_type``, ``size``,
-      ``content_url``, ``available``, and ``expires_at`` are always
-      present.
+    - ``type``, ``id``, ``status``, ``filename``, ``mime_type``,
+      ``content_url``, and ``size`` are always present.
+    - ``available`` and ``expires_at`` are always present on items produced
+      by the current adapter, but default to ``True`` / ``None`` here so
+      that older items predating these fields (e.g. replayed from
+      ``GET /v1/responses/{id}/events``, or read back from a response
+      store populated by an earlier release) still parse instead of
+      raising — consistent with treating an absent ``available`` as
+      best-effort-true, per the next point.
     - ``call_id`` is present only for mapper-created artifacts; its
       absence is meaningful, not missing data.
     - ``available: False`` is authoritative (never attempt the download).
       ``available: True`` or absent is best-effort only, never a
       guarantee — always attempt the download and handle failure.
-    - ``expires_at`` is advisory (a predicted Unix-seconds deadline), not
-      an exact guarantee.
+    - ``expires_at`` is advisory (a predicted Unix-seconds deadline) when
+      present, not an exact guarantee; absent means unknown, not "never
+      expires."
     """
 
     model_config = ConfigDict(extra="allow")
@@ -69,8 +76,8 @@ class ArtifactItem(BaseModel):
     mime_type: str
     size: int
     content_url: str
-    available: bool
-    expires_at: int
+    available: bool = True
+    expires_at: int | None = None
     call_id: str | None = None
 
     @field_validator("content_url")
