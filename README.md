@@ -139,13 +139,18 @@ with zero custom integration.
   (whether the download link is currently expected to work; the
   authoritative signal). `GET /v1/responses/{id}`, `POST
   /v1/responses/{id}/cancel`, and the final `response.completed` /
-  `.incomplete` / `.failed` snapshot of a non-background request (streamed
-  or not, including the WebSocket transport) all recompute these fields
-  against the live registry, so a response never keeps advertising a dead
-  link without saying so — including the narrow case where a same-turn
+  `.incomplete` snapshot of a non-background request (streamed or not,
+  including the WebSocket transport) all recompute these fields against
+  the live registry, so a response never keeps advertising a dead link
+  without saying so — including the narrow case where a same-turn
   registry eviction (another artifact generated later in the same turn
   pushing an earlier one out) would otherwise make the very first response a
-  client sees already stale. Every one of these is a live access: while a
+  client sees already stale. A `.failed` outcome is refreshed the same way
+  when streamed over SSE (its `response.failed` event still carries a full
+  response snapshot); non-streaming HTTP and the WebSocket transport instead
+  surface a `.failed` outcome as an error envelope with no response/artifact
+  data at all, so there is nothing to refresh on those two. Every one of
+  these is a live access: while a
   registered artifact is still live, it extends its download window to a
   fresh full TTL from that moment (sliding expiration) and advances
   `expires_at` to match; once an artifact has expired, been evicted, or been
@@ -439,6 +444,135 @@ persistent `SessionService` (e.g. `DatabaseSessionService`) passed to
 `ADKAdapter` so framework-side conversation state survives restarts too; the
 Pydantic AI adapter keeps all conversation state in the response store
 already.
+
+## Artifact item schema
+
+`ajac-zero:artifact` is a shared extension item type — owned and versioned
+by [ajac-zero/openresponses-extensions](https://github.com/ajac-zero/openresponses-extensions),
+**not** by this repo. That repository is the authoritative,
+cross-implementation contract: its
+[`schemas/artifact.json`](https://github.com/ajac-zero/openresponses-extensions/blob/main/schemas/artifact.json)
+JSON Schema and README define which fields exist, their general value
+constraints, and the universal `expires_at`/`available` semantics. Any
+Open Responses server or client implementing this extension should treat
+that repo as the source of truth, not this section. This implementation
+targets `ajac-zero:artifact` profile `1.1.0` (i.e. it always emits the
+`1.1.0`-introduced `expires_at`/`available` fields, not just the `1.0.0`
+baseline).
+
+This section instead documents how *this implementation* (the Google ADK
+adapter) populates that shared contract — construction paths, `call_id`
+linkage rules, and a few implementation-specific deviations from the
+shared spec (called out explicitly below where they occur): some
+*narrower* than the spec permits (this implementation rejects things the
+spec allows, e.g. `content_url`), others *looser* (this implementation
+accepts things the spec would reject, e.g. `filename`, `mime_type`) — so
+consumers of this specific server don't have to read adapter source to
+use it. A typed model matching this
+implementation's exact output shape ships as
+`fastresponses.artifacts.ArtifactItem`, together with a
+`parse_artifact_item(item)` helper that validates and parses any response
+output item as one:
+
+```python
+from fastresponses.artifacts import parse_artifact_item
+
+for item in response["output"]:
+    if item["type"] == "ajac-zero:artifact":
+        artifact = parse_artifact_item(item)
+        if artifact.available:
+            download(artifact.content_url)
+```
+
+### Fields
+
+| Field | Type | Presence | Notes |
+| --- | --- | --- | --- |
+| `type` | `str` | always | Always the literal `"ajac-zero:artifact"`. |
+| `id` | `str` | always | Opaque `ArtifactRegistry` token, non-empty (matches the shared spec's `minLength: 1`). No format is guaranteed beyond uniqueness. |
+| `status` | `str` | always | Always `"completed"` today; this item is only ever emitted once the artifact is fully saved. |
+| `filename` | `str` | always | Provider-declared filename, arbitrary Unicode. Not guaranteed unique across an entire conversation (later turns may reuse a filename as a new version). Note: this implementation does not enforce the shared spec's stricter `filename` character/length constraints (`schemas/artifact.json`) at emission time — a tool could in principle produce a filename that fails the shared JSON Schema even though this implementation accepts it. |
+| `mime_type` | `str` | always | E.g. `"application/pdf"`. Best-effort (declared by the tool/provider, or guessed from the filename extension, falling back to `"application/octet-stream"`); not validated against the shared spec's stricter `type/subtype` pattern or its `maxLength: 200`, and not schema-enforced against the served `Content-Type` either, which applies its own separate, stricter fallback at download time. |
+| `size` | `int` | always | Byte length of the artifact content (not characters), non-negative (matches the shared spec's `minimum: 0`). |
+| `content_url` | `str` | always | The shared spec permits either an absolute or a relative URL. **This implementation only ever emits a relative path**, of the exact form `/v1/artifacts/{id}/content` — narrower than the spec requires, not a spec rule itself. Resolve it against the same origin/base URL you used for the Responses API call. |
+| `available` | `bool` | always* | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older item predating this field) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
+| `expires_at` | `int \| None` | always* | Unix seconds when present, non-negative (matches the shared spec's `minimum: 0`). Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. `None`/absent means unknown, not "never expires" — treat it the same as an unknown `available`. |
+| `call_id` | `str \| None` | conditional | Present **only** for mapper-created artifacts (see "Construction paths" below), non-empty and at most 64 characters when present (matches the shared spec's `minLength`/`maxLength`). Its absence is meaningful — it means the artifact was not produced in response to a specific internal tool call — not missing data. |
+
+\* Always present on items produced by the current adapter. `ArtifactItem`/`parse_artifact_item` default a missing `available` to `True` and a missing `expires_at` to `None` rather than raising, so older items predating these fields (e.g. replayed via `GET /v1/responses/{id}/events`, or read back from a response store populated by an earlier release) still parse — consistent with treating an absent `available` as best-effort-true.
+
+### Construction paths
+
+The item is identical in shape regardless of path, but `call_id` presence
+differs:
+
+- **Session-generated** (no `call_id`): the agent's own tool code calls
+  ADK's `tool_context.save_artifact(...)` directly; the adapter picks this
+  up from the turn's `artifact_delta` with no linkage back to a specific
+  tool call.
+- **Mapper-created** (always has `call_id`): an `internal_tool_response_mapper`
+  calls `ADKToolResponse.create_artifact(filename, data, mime_type)`, which
+  threads the call_id of the internal `function_call`/`function_call_output`
+  pair that triggered it through to the resulting item.
+
+### Item ordering examples
+
+Non-streaming, session-generated (a tool call's own `save_artifact` still
+produces the same `function_call`/`function_call_output` pair as any other
+tool call — the artifact item that follows just has no `call_id` linking
+it back to that pair):
+
+```json
+{
+  "output": [
+    { "type": "function_call", "call_id": "call_...", "name": "save_report", "...": "..." },
+    { "type": "function_call_output", "call_id": "call_...", "...": "..." },
+    { "type": "ajac-zero:artifact", "id": "artifact_...", "filename": "report.txt", "...": "no call_id key present" },
+    { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Report ready." }] }
+  ]
+}
+```
+
+Streaming, mapper-created (`internal_tool_response_mapper` calling
+`create_artifact`), showing `response.output_item.done` order — the
+artifact always lands immediately after the internal call pair that
+produced it:
+
+```
+response.output_item.done  { "type": "function_call", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "function_call_output", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "ajac-zero:artifact", "call_id": "call_abc", ... }
+response.output_item.done  { "type": "message", ... }
+response.completed         { ... }
+```
+
+### Mutability and backward compatibility
+
+`available` is recomputed fresh on every live read (`GET
+/v1/responses/{id}`, cancel, and the terminal event of a live create — see
+"Artifact expiration is surfaced, not silent" above). `expires_at` is
+refreshed alongside it only while the artifact is still available; once
+`available` flips to `false`, `expires_at` keeps whatever value it last
+had — which may or may not already be in the past, depending on whether
+the cause was natural TTL expiry, capacity eviction, or explicit
+revocation — rather than being recomputed. Ignore `expires_at` once
+`available` is `false`; it carries no meaning at that point. Neither
+field is ever pushed to a copy the client already holds. A client that
+caches an item (e.g. its own database) owns
+re-verifying it — a cached `available: true` can silently go stale, while
+a cached `available: false` for the same `id` will not, since a
+revoked/evicted ID never comes back.
+
+Every field in the table above — including `available` and `expires_at`
+(the `"always*"` rows) — will not be removed or repurposed without a
+breaking (major) release; the `*` only means their *per-item presence* is
+tolerant of older data, not that the fields themselves are any less
+stable than the plain `"always"` ones. `call_id` will continue to be
+present only when applicable. New, additive fields may appear in a future
+minor release; `ArtifactItem` (and `CustomItem` generally) is permissive
+(`extra="allow"`), so unrecognized fields are preserved through
+round-tripping rather than rejected — forward-compatible consumers should
+do the same rather than assuming the field list above is exhaustive.
 
 ## Writing an adapter for another framework
 

@@ -2,16 +2,141 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
-#: artifacts. Shared between the ADK adapter (which creates the item) and
-#: the server (which reports live download availability on retrieval).
+#: artifacts. This item type is owned and versioned by
+#: ajac-zero/openresponses-extensions (schemas/artifact.json), not by this
+#: repo. It is ``ArtifactItem.type``'s default (set once, by the ADK
+#: adapter, when constructing an ``ArtifactItem``) and is used directly by
+#: the server for item-type filtering when refreshing live availability.
 ARTIFACT_TYPE = "ajac-zero:artifact"
+
+#: Matches ``content_url`` values of the exact form this implementation
+#: emits, ``/v1/artifacts/{artifact_id}/content``, requiring a non-empty,
+#: slash-free ``artifact_id`` segment. The shared ajac-zero:artifact spec
+#: also permits an absolute URL; this implementation just never emits one.
+_CONTENT_URL_PATTERN = re.compile(r"/v1/artifacts/[^/]+/content")
+
+
+class ArtifactItem(BaseModel):
+    """Typed schema for this implementation's ``ajac-zero:artifact`` output.
+
+    ``ajac-zero:artifact`` is a shared extension item type owned and
+    versioned by `ajac-zero/openresponses-extensions
+    <https://github.com/ajac-zero/openresponses-extensions>`_ (see its
+    ``schemas/artifact.json`` for the authoritative, cross-implementation
+    JSON Schema contract). This model does **not** replace that contract —
+    it validates the exact, narrower shape *this* implementation (the
+    Google ADK adapter) actually emits, which in places is stricter than
+    what the shared spec permits (e.g. ``content_url`` here is always a
+    relative path, though the shared spec also permits absolute URLs).
+
+    The Google ADK adapter surfaces generated artifacts through two
+    distinct code paths, both producing this same item shape:
+
+    - **Session-generated**: the agent's own tool code calls ADK's
+      ``tool_context.save_artifact(...)`` directly, and the adapter picks
+      it up from the turn's ``artifact_delta``. These items never carry
+      ``call_id`` — ADK does not link the resulting delta back to a
+      specific tool call.
+    - **Mapper-created**: an ``internal_tool_response_mapper`` calls
+      ``ADKToolResponse.create_artifact(...)``. These items always carry
+      ``call_id``, tying the artifact back to the internal
+      ``function_call`` / ``function_call_output`` pair that produced it.
+
+    See the "Artifact item schema" section of ``README.md`` for the full
+    field-by-field contract (including backward-compatibility guarantees).
+    This model exists so consumers can parse and validate artifact items
+    without reading adapter source code; it is intentionally permissive
+    about unknown fields (``extra="allow"``) so that new, additive fields
+    introduced in a future release still round-trip through it instead of
+    raising.
+
+    Beyond types, this model also enforces the shared spec's own
+    ``schemas/artifact.json`` value constraints where they're
+    unconditionally true of any well-formed item (``id`` and ``call_id``
+    non-empty, ``call_id`` at most 64 characters, ``size``/``expires_at``
+    non-negative, and, strictly, ``bool``/``int`` typed — not the JSON
+    string/number/boolean cross-coercions pydantic's default lax mode
+    would otherwise allow, e.g. ``size: "5"`` or ``available: 1``) — every
+    value this implementation actually emits already satisfies these, so
+    this only rejects corrupted/hand-edited input, not anything the
+    adapter itself produces.
+
+    Stability summary:
+
+    - ``type``, ``id``, ``status``, ``filename``, ``mime_type``,
+      ``content_url``, and ``size`` are always present.
+    - ``available`` and ``expires_at`` are always present on items produced
+      by the current adapter, but default to ``True`` / ``None`` here so
+      that older items predating these fields (e.g. replayed from
+      ``GET /v1/responses/{id}/events``, or read back from a response
+      store populated by an earlier release) still parse instead of
+      raising — consistent with treating an absent ``available`` as
+      best-effort-true, per the next point.
+    - ``call_id`` is present only for mapper-created artifacts; its
+      absence is meaningful, not missing data.
+    - ``available: False`` is authoritative (never attempt the download).
+      ``available: True`` or absent is best-effort only, never a
+      guarantee — always attempt the download and handle failure.
+    - ``expires_at`` is advisory (a predicted Unix-seconds deadline) when
+      present, not an exact guarantee; absent means unknown, not "never
+      expires."
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["ajac-zero:artifact"] = ARTIFACT_TYPE
+    id: str = Field(min_length=1)
+    status: Literal["completed"] = "completed"
+    filename: str
+    mime_type: str
+    size: int = Field(ge=0, strict=True)
+    content_url: str
+    available: bool = Field(default=True, strict=True)
+    expires_at: int | None = Field(default=None, ge=0, strict=True)
+    call_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("content_url")
+    @classmethod
+    def _content_url_matches_this_implementations_download_path(
+        cls, value: str
+    ) -> str:
+        """Validate against this implementation's own emitted shape.
+
+        The shared ``ajac-zero:artifact`` contract (see class docstring)
+        permits an absolute URL too; this implementation just never emits
+        one, so this check is intentionally narrower than the shared spec.
+        """
+        if not _CONTENT_URL_PATTERN.fullmatch(value):
+            raise ValueError(
+                "content_url must be a relative path of the form "
+                "'/v1/artifacts/{artifact_id}/content', with a non-empty id "
+                "(this implementation never emits an absolute content_url, "
+                "though the shared ajac-zero:artifact spec permits one)."
+            )
+        return value
+
+
+def parse_artifact_item(item: Any) -> ArtifactItem:
+    """Parse a response output item as a typed, validated ``ArtifactItem``.
+
+    Accepts a pydantic model instance (e.g. the ``CustomItem`` fastresponses
+    itself emits) or a plain ``dict`` (e.g. read back from stored JSON).
+    Raises ``pydantic.ValidationError`` if ``item`` is not a well-formed
+    ``ajac-zero:artifact`` item, including when its ``type`` does not
+    match.
+    """
+    payload = item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+    return ArtifactItem.model_validate(payload)
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import ToolContext
 from google.genai import types
+from pydantic import ValidationError
 
 from fastresponses.adapter import AdapterError
 from fastresponses.adapters.adk import (
@@ -28,7 +30,12 @@ from fastresponses.adapters.adk import (
     _EventTranslator,
     _GeneratedArtifactPolicy,
 )
-from fastresponses.artifacts import ArtifactRecord, ArtifactRegistry
+from fastresponses.artifacts import (
+    ArtifactItem,
+    ArtifactRecord,
+    ArtifactRegistry,
+    parse_artifact_item,
+)
 from fastresponses.models import CustomItem
 from fastresponses.server import create_app
 
@@ -1576,6 +1583,282 @@ def test_get_response_refreshes_and_expires_artifact_availability(monkeypatch):
     refreshed = _generated_artifacts(refetched)[0]
     assert refreshed["available"] is False
     assert client.get(artifact["content_url"]).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Formal schema (issue #13): every ajac-zero:artifact item, from either
+# construction path, must validate against the public `ArtifactItem` model.
+# ---------------------------------------------------------------------------
+
+
+def test_session_generated_artifact_matches_documented_schema():
+    """save_artifact-triggered items still follow the same function_call/
+    function_call_output pair as any other tool call (README "Item ordering
+    examples"), but the artifact item itself never carries call_id."""
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+
+    assert [item["type"] for item in body["output"]] == [
+        "function_call",
+        "function_call_output",
+        "ajac-zero:artifact",
+        "message",
+    ]
+    raw = _generated_artifacts(body)[0]
+
+    artifact = parse_artifact_item(raw)
+
+    assert artifact.filename == "report.txt"
+    assert artifact.mime_type == "text/plain"
+    assert artifact.size == len(b"generated report")
+    assert artifact.status == "completed"
+    assert artifact.content_url == raw["content_url"]
+    assert artifact.available is True
+    assert artifact.call_id is None
+    assert "call_id" not in raw
+
+
+def test_mapper_created_artifact_matches_documented_schema_and_carries_call_id():
+    """ADKToolResponse.create_artifact-triggered items always carry call_id,
+    linking back to the internal function_call/function_call_output pair,
+    and land after that pair in item order."""
+
+    async def mapper(response: ADKToolResponse):
+        return [
+            await response.create_artifact("summary.txt", b"weather summary", "text/plain")
+        ]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+    )
+    body = TestClient(create_app(adapter)).post(
+        "/v1/responses", json={"input": "weather?"}
+    ).json()
+
+    assert [item["type"] for item in body["output"]] == [
+        "function_call",
+        "function_call_output",
+        "ajac-zero:artifact",
+        "message",
+    ]
+    call_id = body["output"][0]["call_id"]
+    raw = _generated_artifacts(body)[0]
+
+    artifact = parse_artifact_item(raw)
+
+    assert artifact.call_id == call_id
+    assert artifact.filename == "summary.txt"
+    assert artifact.size == len(b"weather summary")
+
+
+def test_streaming_mapper_created_artifact_matches_documented_ordering():
+    """Backs the README "Item ordering examples" streaming case: the
+    artifact's response.output_item.done event lands immediately after the
+    function_call/function_call_output pair that produced it, and carries
+    that pair's call_id."""
+
+    async def mapper(response: ADKToolResponse):
+        return [
+            await response.create_artifact("summary.txt", b"weather summary", "text/plain")
+        ]
+
+    llm = ScriptedLlm(
+        turns=[call_turn("get_weather", {"city": "Tokyo"}), text_turn("Done.")],
+        requests=[],
+    )
+    adapter = ADKAdapter(
+        Agent(name="test_agent", model=llm, tools=[get_weather]),
+        app_name="test-app",
+        internal_tool_response_mapper=mapper,
+    )
+    client = TestClient(create_app(adapter))
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "weather?", "stream": True}
+    ) as stream:
+        payloads = [event for event in read_sse(stream) if isinstance(event, dict)]
+
+    done_items = [
+        event["item"]
+        for event in payloads
+        if event["type"] == "response.output_item.done"
+    ]
+    assert [item["type"] for item in done_items] == [
+        "function_call",
+        "function_call_output",
+        "ajac-zero:artifact",
+        "message",
+    ]
+    call_id = done_items[0]["call_id"]
+    assert done_items[1]["call_id"] == call_id
+    assert done_items[2]["call_id"] == call_id
+    assert payloads[-1]["type"] == "response.completed"
+
+
+def test_artifact_item_schema_tolerates_unknown_future_fields():
+    """New, additive fields must round-trip rather than raise, so older
+    typed consumers keep working against a future minor release."""
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "status": "completed",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": "/v1/artifacts/artifact_abc123/content",
+        "available": True,
+        "expires_at": 1_700_000_000,
+        "checksum": "sha256:deadbeef",  # hypothetical future field
+    }
+
+    artifact = ArtifactItem.model_validate(payload)
+
+    assert artifact.model_dump(mode="json", exclude_none=True)["checksum"] == (
+        "sha256:deadbeef"
+    )
+
+
+def test_artifact_item_schema_tolerates_pre_expiration_items_missing_fields():
+    """available/expires_at were added to this item in a later release
+    (fastresponses#19); an item predating them (e.g. replayed from
+    GET /v1/responses/{id}/events, or read back from a response store
+    populated by an earlier release) must still parse, defaulting to the
+    documented best-effort semantics rather than raising."""
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "status": "completed",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": "/v1/artifacts/artifact_abc123/content",
+        # no "available", no "expires_at"
+    }
+
+    artifact = parse_artifact_item(payload)
+
+    assert artifact.available is True
+    assert artifact.expires_at is None
+
+
+@pytest.mark.parametrize(
+    "content_url",
+    [
+        "https://example.com/artifact_abc123",  # absolute, not a relative path
+        "/v1/artifacts/content",  # missing the artifact_id segment entirely
+        "/v1/artifacts//content",  # empty artifact_id segment
+        "/v1/artifacts/abc/def/content",  # id segment must not contain a slash
+    ],
+)
+def test_artifact_item_schema_rejects_malformed_content_url(content_url):
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": content_url,
+        "available": True,
+        "expires_at": 1_700_000_000,
+    }
+
+    with pytest.raises(ValidationError):
+        ArtifactItem.model_validate(payload)
+
+
+def test_parse_artifact_item_rejects_non_artifact_type():
+    with pytest.raises(ValidationError):
+        parse_artifact_item({"type": "message", "id": "msg_1", "role": "assistant"})
+
+
+def _valid_artifact_payload(**overrides):
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": "/v1/artifacts/artifact_abc123/content",
+        "available": True,
+        "expires_at": 1_700_000_000,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": ""},  # spec requires id minLength: 1
+        {"size": -1},  # spec requires size minimum: 0
+        {"expires_at": -1},  # spec requires expires_at minimum: 0
+        {"call_id": ""},  # spec requires call_id minLength: 1
+        {"call_id": "c" * 65},  # spec requires call_id maxLength: 64
+    ],
+)
+def test_artifact_item_schema_enforces_shared_spec_value_constraints(overrides):
+    """ArtifactItem mirrors schemas/artifact.json's own value constraints
+    (id/call_id non-empty, call_id <= 64 chars, size/expires_at >= 0) for
+    any well-formed item, even though these are never violated by values
+    this implementation itself emits."""
+    with pytest.raises(ValidationError):
+        ArtifactItem.model_validate(_valid_artifact_payload(**overrides))
+
+
+def test_artifact_item_schema_accepts_boundary_values_matching_shared_spec():
+    artifact = ArtifactItem.model_validate(
+        _valid_artifact_payload(size=0, expires_at=0, call_id="c" * 64)
+    )
+    assert artifact.size == 0
+    assert artifact.expires_at == 0
+    assert artifact.call_id == "c" * 64
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"size": True},  # JSON boolean is not a JSON integer per the shared schema
+        {"size": "5"},  # JSON string is not a JSON integer per the shared schema
+        {"expires_at": True},  # same cross-type coercion, for expires_at
+        {"available": 1},  # JSON integer is not a JSON boolean per the shared schema
+        {"available": "true"},  # JSON string is not a JSON boolean either
+    ],
+)
+def test_artifact_item_schema_rejects_wrong_json_type_even_if_coercible(overrides):
+    """pydantic's default lax mode would silently coerce these (bool->int,
+    str->int, int->bool) instead of raising, even though schemas/artifact.json
+    declares strict JSON types that none of these values satisfy. Must be
+    parsed from JSON text (model_validate_json), not a Python dict, since a
+    plain dict already carries a concrete Python type that bypasses the
+    JSON-type distinction being tested here."""
+    payload = _valid_artifact_payload(**overrides)
+    with pytest.raises(ValidationError):
+        ArtifactItem.model_validate_json(json.dumps(payload))
+
+
+def test_artifact_item_round_trips_from_stored_response_json():
+    """An artifact item read back out of stored response JSON (e.g. via
+    ResponseStore) must parse identically to the one served live."""
+    client, _ = _make_artifact_adapter(
+        [call_turn("save_report", {}), text_turn("Report ready.")],
+        tools=[save_report],
+    )
+    body = client.post("/v1/responses", json={"input": "make a report"}).json()
+    raw = _generated_artifacts(body)[0]
+
+    round_tripped = ArtifactItem.model_validate(raw).model_dump(
+        mode="json", exclude_none=True
+    )
+
+    assert round_tripped == raw
 
 
 def test_inline_input_file_is_not_emitted_as_output_artifact():
