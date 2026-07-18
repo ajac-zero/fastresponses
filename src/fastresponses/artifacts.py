@@ -64,9 +64,12 @@ class ArtifactItem(BaseModel):
     ``schemas/artifact.json`` value constraints where they're
     unconditionally true of any well-formed item (``id`` and ``call_id``
     non-empty, ``call_id`` at most 64 characters, ``size``/``expires_at``
-    non-negative) — every value this implementation actually emits already
-    satisfies these, so this only rejects corrupted/hand-edited input, not
-    anything the adapter itself produces.
+    non-negative, and, strictly, ``bool``/``int`` typed — not the JSON
+    string/number/boolean cross-coercions pydantic's default lax mode
+    would otherwise allow, e.g. ``size: "5"`` or ``available: 1``) — every
+    value this implementation actually emits already satisfies these, so
+    this only rejects corrupted/hand-edited input, not anything the
+    adapter itself produces.
 
     Stability summary:
 
@@ -96,10 +99,10 @@ class ArtifactItem(BaseModel):
     status: Literal["completed"] = "completed"
     filename: str
     mime_type: str
-    size: int = Field(ge=0)
+    size: int = Field(ge=0, strict=True)
     content_url: str
-    available: bool = True
-    expires_at: int | None = Field(default=None, ge=0)
+    available: bool = Field(default=True, strict=True)
+    expires_at: int | None = Field(default=None, ge=0, strict=True)
     call_id: str | None = Field(default=None, min_length=1, max_length=64)
 
     @field_validator("content_url")

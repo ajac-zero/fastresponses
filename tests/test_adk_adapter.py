@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -1819,6 +1820,28 @@ def test_artifact_item_schema_accepts_boundary_values_matching_shared_spec():
     assert artifact.size == 0
     assert artifact.expires_at == 0
     assert artifact.call_id == "c" * 64
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"size": True},  # JSON boolean is not a JSON integer per the shared schema
+        {"size": "5"},  # JSON string is not a JSON integer per the shared schema
+        {"expires_at": True},  # same cross-type coercion, for expires_at
+        {"available": 1},  # JSON integer is not a JSON boolean per the shared schema
+        {"available": "true"},  # JSON string is not a JSON boolean either
+    ],
+)
+def test_artifact_item_schema_rejects_wrong_json_type_even_if_coercible(overrides):
+    """pydantic's default lax mode would silently coerce these (bool->int,
+    str->int, int->bool) instead of raising, even though schemas/artifact.json
+    declares strict JSON types that none of these values satisfy. Must be
+    parsed from JSON text (model_validate_json), not a Python dict, since a
+    plain dict already carries a concrete Python type that bypasses the
+    JSON-type distinction being tested here."""
+    payload = _valid_artifact_payload(**overrides)
+    with pytest.raises(ValidationError):
+        ArtifactItem.model_validate_json(json.dumps(payload))
 
 
 def test_artifact_item_round_trips_from_stored_response_json():
