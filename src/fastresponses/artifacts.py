@@ -9,7 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
 #: artifacts. This item type is owned and versioned by
@@ -60,6 +60,14 @@ class ArtifactItem(BaseModel):
     introduced in a future release still round-trip through it instead of
     raising.
 
+    Beyond types, this model also enforces the shared spec's own
+    ``schemas/artifact.json`` value constraints where they're
+    unconditionally true of any well-formed item (``id`` and ``call_id``
+    non-empty, ``call_id`` at most 64 characters, ``size``/``expires_at``
+    non-negative) — every value this implementation actually emits already
+    satisfies these, so this only rejects corrupted/hand-edited input, not
+    anything the adapter itself produces.
+
     Stability summary:
 
     - ``type``, ``id``, ``status``, ``filename``, ``mime_type``,
@@ -84,15 +92,15 @@ class ArtifactItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     type: Literal["ajac-zero:artifact"] = ARTIFACT_TYPE
-    id: str
+    id: str = Field(min_length=1)
     status: Literal["completed"] = "completed"
     filename: str
     mime_type: str
-    size: int
+    size: int = Field(ge=0)
     content_url: str
     available: bool = True
-    expires_at: int | None = None
-    call_id: str | None = None
+    expires_at: int | None = Field(default=None, ge=0)
+    call_id: str | None = Field(default=None, min_length=1, max_length=64)
 
     @field_validator("content_url")
     @classmethod

@@ -1778,6 +1778,49 @@ def test_parse_artifact_item_rejects_non_artifact_type():
         parse_artifact_item({"type": "message", "id": "msg_1", "role": "assistant"})
 
 
+def _valid_artifact_payload(**overrides):
+    payload = {
+        "type": "ajac-zero:artifact",
+        "id": "artifact_abc123",
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "size": 12,
+        "content_url": "/v1/artifacts/artifact_abc123/content",
+        "available": True,
+        "expires_at": 1_700_000_000,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": ""},  # spec requires id minLength: 1
+        {"size": -1},  # spec requires size minimum: 0
+        {"expires_at": -1},  # spec requires expires_at minimum: 0
+        {"call_id": ""},  # spec requires call_id minLength: 1
+        {"call_id": "c" * 65},  # spec requires call_id maxLength: 64
+    ],
+)
+def test_artifact_item_schema_enforces_shared_spec_value_constraints(overrides):
+    """ArtifactItem mirrors schemas/artifact.json's own value constraints
+    (id/call_id non-empty, call_id <= 64 chars, size/expires_at >= 0) for
+    any well-formed item, even though these are never violated by values
+    this implementation itself emits."""
+    with pytest.raises(ValidationError):
+        ArtifactItem.model_validate(_valid_artifact_payload(**overrides))
+
+
+def test_artifact_item_schema_accepts_boundary_values_matching_shared_spec():
+    artifact = ArtifactItem.model_validate(
+        _valid_artifact_payload(size=0, expires_at=0, call_id="c" * 64)
+    )
+    assert artifact.size == 0
+    assert artifact.expires_at == 0
+    assert artifact.call_id == "c" * 64
+
+
 def test_artifact_item_round_trips_from_stored_response_json():
     """An artifact item read back out of stored response JSON (e.g. via
     ResponseStore) must parse identically to the one served live."""
