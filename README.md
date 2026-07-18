@@ -447,12 +447,23 @@ already.
 
 ## Artifact item schema
 
-`ajac-zero:artifact` is an `ajac-zero`-namespaced extension item (a
-`CustomItem` in `fastresponses.models` terms) surfaced by the Google ADK
-adapter for downloadable generated artifacts (reports, files, images, ...
-saved during a turn). This section is the formal, field-by-field contract
-for that item, so consumers can implement handling for it without reading
-adapter source. A typed model matching this contract ships as
+`ajac-zero:artifact` is a shared extension item type — owned and versioned
+by [ajac-zero/openresponses-extensions](https://github.com/ajac-zero/openresponses-extensions),
+**not** by this repo. That repository is the authoritative,
+cross-implementation contract: its
+[`schemas/artifact.json`](https://github.com/ajac-zero/openresponses-extensions/blob/main/schemas/artifact.json)
+JSON Schema and README define which fields exist, their general value
+constraints, and the universal `expires_at`/`available` semantics. Any
+Open Responses server or client implementing this extension should treat
+that repo as the source of truth, not this section.
+
+This section instead documents how *this implementation* (the Google ADK
+adapter) populates that shared contract — construction paths, `call_id`
+linkage rules, and a couple of implementation-specific choices that are
+*narrower* than what the shared spec permits (called out explicitly below
+where they occur) — so consumers of this specific server don't have to
+read adapter source to use it. A typed model matching this
+implementation's exact output shape ships as
 `fastresponses.artifacts.ArtifactItem`, together with a
 `parse_artifact_item(item)` helper that validates and parses any response
 output item as one:
@@ -474,10 +485,10 @@ for item in response["output"]:
 | `type` | `str` | always | Always the literal `"ajac-zero:artifact"`. |
 | `id` | `str` | always | Opaque `ArtifactRegistry` token. Treat as an opaque string — no format is guaranteed beyond uniqueness. |
 | `status` | `str` | always | Always `"completed"` today; this item is only ever emitted once the artifact is fully saved. |
-| `filename` | `str` | always | Provider-declared filename, arbitrary Unicode. Not guaranteed unique across an entire conversation (later turns may reuse a filename as a new version). |
-| `mime_type` | `str` | always | E.g. `"application/pdf"`. Best-effort (declared by the tool/provider, or guessed from the filename extension, falling back to `"application/octet-stream"`); not schema-enforced against the served `Content-Type`, which applies its own stricter fallback at download time. |
+| `filename` | `str` | always | Provider-declared filename, arbitrary Unicode. Not guaranteed unique across an entire conversation (later turns may reuse a filename as a new version). Note: this implementation does not enforce the shared spec's stricter `filename` character/length constraints (`schemas/artifact.json`) at emission time — a tool could in principle produce a filename that fails the shared JSON Schema even though this implementation accepts it. |
+| `mime_type` | `str` | always | E.g. `"application/pdf"`. Best-effort (declared by the tool/provider, or guessed from the filename extension, falling back to `"application/octet-stream"`); not validated against the shared spec's stricter `type/subtype` pattern, and not schema-enforced against the served `Content-Type` either, which applies its own separate, stricter fallback at download time. |
 | `size` | `int` | always | Byte length of the artifact content (not characters). |
-| `content_url` | `str` | always | Always a **relative path** of the exact form `/v1/artifacts/{id}/content` — never an absolute URL. Resolve it against the same origin/base URL you used for the Responses API call. |
+| `content_url` | `str` | always | The shared spec permits either an absolute or a relative URL. **This implementation only ever emits a relative path**, of the exact form `/v1/artifacts/{id}/content` — narrower than the spec requires, not a spec rule itself. Resolve it against the same origin/base URL you used for the Responses API call. |
 | `available` | `bool` | always* | The authoritative signal. `false` means: do not attempt the download, it will fail. `true` (or the field being absent on an older item predating this field) is **best-effort only, never a guarantee** — always attempt the download and handle failure regardless. See "Mutability" below. |
 | `expires_at` | `int \| None` | always* | Unix seconds when present. Advisory — a predicted deadline (`now + ttl` at the time this copy was produced), not an exact guarantee. Use it to decide when a cached copy is worth re-verifying, not as a hard cutover instant. `None`/absent means unknown, not "never expires" — treat it the same as an unknown `available`. |
 | `call_id` | `str \| None` | conditional | Present **only** for mapper-created artifacts (see "Construction paths" below). Its absence is meaningful — it means the artifact was not produced in response to a specific internal tool call — not missing data. |

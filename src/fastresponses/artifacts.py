@@ -12,18 +12,32 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, field_validator
 
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
-#: artifacts. Shared between the ADK adapter (which creates the item) and
-#: the server (which reports live download availability on retrieval).
+#: artifacts. This item type is owned and versioned by
+#: ajac-zero/openresponses-extensions (schemas/artifact.json), not by this
+#: repo; ``ARTIFACT_TYPE`` is shared here between the ADK adapter (which
+#: creates the item) and the server (which reports live download
+#: availability on retrieval).
 ARTIFACT_TYPE = "ajac-zero:artifact"
 
-#: Matches ``content_url`` values of the exact documented form
-#: ``/v1/artifacts/{artifact_id}/content``, requiring a non-empty,
-#: slash-free ``artifact_id`` segment.
+#: Matches ``content_url`` values of the exact form this implementation
+#: emits, ``/v1/artifacts/{artifact_id}/content``, requiring a non-empty,
+#: slash-free ``artifact_id`` segment. The shared ajac-zero:artifact spec
+#: also permits an absolute URL; this implementation just never emits one.
 _CONTENT_URL_PATTERN = re.compile(r"/v1/artifacts/[^/]+/content")
 
 
 class ArtifactItem(BaseModel):
-    """Formal, typed schema for the ``ajac-zero:artifact`` extension item.
+    """Typed schema for this implementation's ``ajac-zero:artifact`` output.
+
+    ``ajac-zero:artifact`` is a shared extension item type owned and
+    versioned by `ajac-zero/openresponses-extensions
+    <https://github.com/ajac-zero/openresponses-extensions>`_ (see its
+    ``schemas/artifact.json`` for the authoritative, cross-implementation
+    JSON Schema contract). This model does **not** replace that contract —
+    it validates the exact, narrower shape *this* implementation (the
+    Google ADK adapter) actually emits, which in places is stricter than
+    what the shared spec permits (e.g. ``content_url`` here is always a
+    relative path, though the shared spec also permits absolute URLs).
 
     The Google ADK adapter surfaces generated artifacts through two
     distinct code paths, both producing this same item shape:
@@ -82,11 +96,21 @@ class ArtifactItem(BaseModel):
 
     @field_validator("content_url")
     @classmethod
-    def _content_url_is_relative_download_path(cls, value: str) -> str:
+    def _content_url_matches_this_implementations_download_path(
+        cls, value: str
+    ) -> str:
+        """Validate against this implementation's own emitted shape.
+
+        The shared ``ajac-zero:artifact`` contract (see class docstring)
+        permits an absolute URL too; this implementation just never emits
+        one, so this check is intentionally narrower than the shared spec.
+        """
         if not _CONTENT_URL_PATTERN.fullmatch(value):
             raise ValueError(
                 "content_url must be a relative path of the form "
-                "'/v1/artifacts/{artifact_id}/content', with a non-empty id."
+                "'/v1/artifacts/{artifact_id}/content', with a non-empty id "
+                "(this implementation never emits an absolute content_url, "
+                "though the shared ajac-zero:artifact spec permits one)."
             )
         return value
 
