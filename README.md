@@ -455,14 +455,20 @@ cross-implementation contract: its
 JSON Schema and README define which fields exist, their general value
 constraints, and the universal `expires_at`/`available` semantics. Any
 Open Responses server or client implementing this extension should treat
-that repo as the source of truth, not this section.
+that repo as the source of truth, not this section. This implementation
+targets `ajac-zero:artifact` profile `1.1.0` (i.e. it always emits the
+`1.1.0`-introduced `expires_at`/`available` fields, not just the `1.0.0`
+baseline).
 
 This section instead documents how *this implementation* (the Google ADK
 adapter) populates that shared contract — construction paths, `call_id`
-linkage rules, and a couple of implementation-specific choices that are
-*narrower* than what the shared spec permits (called out explicitly below
-where they occur) — so consumers of this specific server don't have to
-read adapter source to use it. A typed model matching this
+linkage rules, and a few implementation-specific deviations from the
+shared spec (called out explicitly below where they occur): some
+*narrower* than the spec permits (this implementation rejects things the
+spec allows, e.g. `content_url`), others *looser* (this implementation
+accepts things the spec would reject, e.g. `filename`, `mime_type`) — so
+consumers of this specific server don't have to read adapter source to
+use it. A typed model matching this
 implementation's exact output shape ships as
 `fastresponses.artifacts.ArtifactItem`, together with a
 `parse_artifact_item(item)` helper that validates and parses any response

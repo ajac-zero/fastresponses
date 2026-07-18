@@ -14,9 +14,9 @@ from pydantic import BaseModel, ConfigDict, field_validator
 #: ``type`` of the ``CustomItem`` used to surface downloadable generated
 #: artifacts. This item type is owned and versioned by
 #: ajac-zero/openresponses-extensions (schemas/artifact.json), not by this
-#: repo; ``ARTIFACT_TYPE`` is shared here between the ADK adapter (which
-#: creates the item) and the server (which reports live download
-#: availability on retrieval).
+#: repo. It is ``ArtifactItem.type``'s default (set once, by the ADK
+#: adapter, when constructing an ``ArtifactItem``) and is used directly by
+#: the server for item-type filtering when refreshing live availability.
 ARTIFACT_TYPE = "ajac-zero:artifact"
 
 #: Matches ``content_url`` values of the exact form this implementation
